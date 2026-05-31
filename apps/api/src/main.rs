@@ -22,10 +22,12 @@ use crate::crypto::Crypto;
 use crate::db::Db;
 use crate::notifier::Notifier;
 use anyhow::{Context, Result};
+use axum::http::{header, HeaderValue};
 use axum_login::AuthManagerLayerBuilder;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, SessionManagerLayer};
@@ -110,6 +112,29 @@ async fn main() -> Result<()> {
 
     let app = routes::router(state.clone())
         .layer(auth_layer)
+        // Security headers. `frame-ancestors 'none'` + X-Frame-Options give clickjacking
+        // protection without restricting resource loading (a full resource CSP can be added
+        // once the SPA/htmx asset origins are pinned).
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;

@@ -21,7 +21,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
 
 # Database (pure-Rust SQLite, no CGO needed for ARM cross-compile)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
