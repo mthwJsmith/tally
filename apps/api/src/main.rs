@@ -13,6 +13,7 @@ mod models;
 mod notifier;
 mod oidc;
 mod ratelimit;
+mod recurrence;
 mod routes;
 mod rules;
 mod scheduler;

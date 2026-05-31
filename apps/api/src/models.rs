@@ -84,6 +84,24 @@ pub struct Account {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
+pub struct Reminder {
+    pub id: i64,
+    pub title: String,
+    pub notes: Option<String>,
+    pub freq: String,
+    pub every_n: i64,
+    pub anchor_day: Option<i64>,
+    pub due_at: i64,
+    pub notify_before: i64,
+    pub notify_enabled: i64,
+    pub completed_at: Option<i64>,
+    pub notified_at: Option<i64>,
+    pub archived: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct RecurringEntry {
     pub id: i64,
     pub account_id: i64,

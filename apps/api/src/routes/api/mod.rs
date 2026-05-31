@@ -7,6 +7,7 @@ pub mod budgets;
 pub mod categories;
 pub mod csv_import;
 pub mod holdings;
+pub mod reminders;
 pub mod rules;
 pub mod tags;
 pub mod transactions;

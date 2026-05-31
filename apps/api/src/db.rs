@@ -1282,6 +1282,159 @@ impl Db {
     }
 
     // ============================================================
+    // Reminders / checklists
+    // ============================================================
+
+    pub async fn list_reminders(&self) -> Result<Vec<Reminder>> {
+        Ok(
+            sqlx::query_as::<_, Reminder>(
+                "SELECT * FROM reminders WHERE archived = 0 ORDER BY due_at ASC",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_reminder(
+        &self,
+        title: &str,
+        notes: Option<&str>,
+        freq: &str,
+        every_n: i64,
+        anchor_day: Option<i64>,
+        due_at: i64,
+        notify_before: i64,
+        notify_enabled: bool,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO reminders (title, notes, freq, every_n, anchor_day, due_at,
+                notify_before, notify_enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(title)
+        .bind(notes)
+        .bind(freq)
+        .bind(every_n)
+        .bind(anchor_day)
+        .bind(due_at)
+        .bind(notify_before)
+        .bind(if notify_enabled { 1 } else { 0 })
+        .bind(now)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    pub async fn update_reminder(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        notes: Option<&str>,
+        notify_before: Option<i64>,
+        notify_enabled: Option<bool>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "UPDATE reminders SET
+                title = COALESCE(?, title),
+                notes = COALESCE(?, notes),
+                notify_before = COALESCE(?, notify_before),
+                notify_enabled = COALESCE(?, notify_enabled),
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(title)
+        .bind(notes)
+        .bind(notify_before)
+        .bind(notify_enabled.map(|b| if b { 1 } else { 0 }))
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn tick_reminder(&self, id: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query("UPDATE reminders SET completed_at = ?, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn untick_reminder(&self, id: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query("UPDATE reminders SET completed_at = NULL, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_reminder(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM reminders WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Active, enabled reminders within their notify window not yet ticked or pinged this period.
+    pub async fn reminders_to_notify(&self, now: i64) -> Result<Vec<Reminder>> {
+        Ok(sqlx::query_as::<_, Reminder>(
+            "SELECT * FROM reminders
+             WHERE archived = 0 AND notify_enabled = 1
+               AND completed_at IS NULL AND notified_at IS NULL
+               AND ? >= due_at - notify_before",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn mark_reminder_notified(&self, id: i64, now: i64) -> Result<()> {
+        sqlx::query("UPDATE reminders SET notified_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Reminders whose current period has elapsed and need rolling to the next deadline.
+    pub async fn reminders_to_roll(&self, now: i64) -> Result<Vec<Reminder>> {
+        Ok(
+            sqlx::query_as::<_, Reminder>(
+                "SELECT * FROM reminders WHERE archived = 0 AND ? >= due_at",
+            )
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
+    pub async fn roll_reminder(&self, id: i64, next_due: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "UPDATE reminders SET due_at = ?, completed_at = NULL, notified_at = NULL,
+                updated_at = ? WHERE id = ?",
+        )
+        .bind(next_due)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ============================================================
     // v2 — Holdings / brokers / quotes
     // ============================================================
 

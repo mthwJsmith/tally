@@ -98,9 +98,6 @@ impl Notifier {
     }
 
     async fn telegram_message(&self, txn: &TLTransaction, account: &Account, is_pending: bool) {
-        let (Some(tok), Some(chat)) = (&self.telegram_token, &self.telegram_chat) else {
-            return;
-        };
         let prefix = if is_pending { "⏳ pending" } else { "✅" };
         let sign = if txn.transaction_type.eq_ignore_ascii_case("DEBIT") {
             "-"
@@ -114,12 +111,21 @@ impl Notifier {
             txn.description,
             txn.merchant_name.as_deref().unwrap_or(""),
         );
+        self.send_telegram_text(&text, is_pending).await;
+    }
+
+    /// Send an arbitrary Markdown message via Telegram. No-op if Telegram isn't configured.
+    /// Used by reminders and deal alerts as well as transaction notifications.
+    pub async fn send_telegram_text(&self, text: &str, silent: bool) {
+        let (Some(tok), Some(chat)) = (&self.telegram_token, &self.telegram_chat) else {
+            return;
+        };
         let url = format!("https://api.telegram.org/bot{tok}/sendMessage");
         let body = json!({
             "chat_id": chat,
             "text": text,
             "parse_mode": "Markdown",
-            "disable_notification": is_pending,
+            "disable_notification": silent,
         });
         match self.http.post(&url).json(&body).send().await {
             Ok(r) if r.status().is_success() => debug!("telegram sent"),

@@ -60,6 +60,8 @@ serde_urlencoded = "0.7"
 
 # v2: rule engine, auth, CSV import
 regex = "1"
+# RSS 2.0 parsing for the deal watchlist (HotUKDeals / CamelCamelCamel feeds)
+rss = "2"
 totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
 axum-extra = { version = "0.10", features = ["typed-header", "cookie"] }
 csv = "1"
