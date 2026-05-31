@@ -11,3 +11,4 @@ pub mod reminders;
 pub mod rules;
 pub mod tags;
 pub mod transactions;
+pub mod watchlist;
