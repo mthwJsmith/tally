@@ -3,16 +3,23 @@
 # Run:
 #   1. `cp apps/api/.env.example .env` and fill in values
 #   2. `docker compose up -d --build`
-#   3. open https://localhost:3001 (or your reverse-proxy URL)
+#   3. open http://localhost:3001 (put a TLS reverse proxy in front for remote access)
+#
+# For zero-trust + the MCP OIDC connector, also bring up the IdP:
+#   `docker compose -f docker-compose.yml -f docker-compose.idp.yml up -d`
 
 services:
   tally:
-    build: ./apps/api
+    # Build context is the repo ROOT (the Dockerfile COPYs apps/web and apps/api).
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
     image: tally:local
     container_name: tally
     restart: unless-stopped
     ports:
-      - "3001:3001"
+      # Bound to localhost — put a TLS reverse proxy (Caddy/Traefik) in front for remote access.
+      - "127.0.0.1:3001:3001"
     volumes:
       - tally-data:/app/data
     env_file:
@@ -24,6 +31,11 @@ services:
       start_period: 15s
       retries: 3
     mem_limit: 200m
+    # Runtime hardening — drop all Linux capabilities and forbid privilege escalation.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   tally-data:
