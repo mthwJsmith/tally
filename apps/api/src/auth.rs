@@ -21,9 +21,6 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 use totp_rs::{Algorithm, Secret, TOTP};
 
-const SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60; // 30 days
-pub const SESSION_COOKIE: &str = "tally_session";
-
 #[derive(Debug, Clone, FromRow)]
 pub struct User {
     pub id: i64,
@@ -37,17 +34,6 @@ pub struct User {
     pub is_admin: i64,
     pub created_at: i64,
     pub last_login_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub struct Session {
-    pub id: String,
-    pub user_id: i64,
-    pub created_at: i64,
-    pub expires_at: i64,
-    pub ip: Option<String>,
-    pub user_agent: Option<String>,
-    pub awaiting_2fa: i64,
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
@@ -68,14 +54,6 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
-}
-
-pub fn new_session_token() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(48)
-        .map(char::from)
-        .collect()
 }
 
 pub fn hash_api_token(raw: &str) -> String {
@@ -158,57 +136,6 @@ pub async fn find_user_by_username(db: &Db, username: &str) -> Result<Option<Use
     .bind(username)
     .fetch_optional(&db.pool)
     .await?)
-}
-
-pub async fn create_session(
-    db: &Db,
-    user_id: i64,
-    awaiting_2fa: bool,
-    ip: Option<&str>,
-    user_agent: Option<&str>,
-) -> Result<String> {
-    let token = new_session_token();
-    let now = chrono::Utc::now().timestamp();
-    sqlx::query(
-        "INSERT INTO sessions (id, user_id, created_at, expires_at, ip, user_agent, awaiting_2fa)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&token)
-    .bind(user_id)
-    .bind(now)
-    .bind(now + SESSION_TTL_SECONDS)
-    .bind(ip)
-    .bind(user_agent)
-    .bind(if awaiting_2fa { 1 } else { 0 })
-    .execute(&db.pool)
-    .await?;
-    Ok(token)
-}
-
-pub async fn get_session(db: &Db, token: &str) -> Result<Option<Session>> {
-    Ok(sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE id = ? AND expires_at > ?",
-    )
-    .bind(token)
-    .bind(chrono::Utc::now().timestamp())
-    .fetch_optional(&db.pool)
-    .await?)
-}
-
-pub async fn complete_2fa_session(db: &Db, token: &str) -> Result<()> {
-    sqlx::query("UPDATE sessions SET awaiting_2fa = 0 WHERE id = ?")
-        .bind(token)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn delete_session(db: &Db, token: &str) -> Result<()> {
-    sqlx::query("DELETE FROM sessions WHERE id = ?")
-        .bind(token)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
 }
 
 pub async fn save_totp_secret(

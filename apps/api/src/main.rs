@@ -3,6 +3,7 @@
 
 mod ai;
 mod auth;
+mod auth_backend;
 mod clients;
 mod crypto;
 mod db;
@@ -20,10 +21,14 @@ use crate::crypto::Crypto;
 use crate::db::Db;
 use crate::notifier::Notifier;
 use anyhow::{Context, Result};
+use axum_login::AuthManagerLayerBuilder;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
+use tower_sessions::cookie::SameSite;
+use tower_sessions::{Expiry, SessionManagerLayer};
+use tower_sessions_sqlx_store::SqliteStore;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -64,6 +69,23 @@ async fn main() -> Result<()> {
 
     let crypto = Crypto::from_env()?;
     let db = Db::connect(&database_url, crypto).await?;
+
+    // Session store + axum-login auth layer (replaces the hand-rolled `sessions` table).
+    let session_store = SqliteStore::new(db.pool.clone());
+    session_store
+        .migrate()
+        .await
+        .context("migrating session store")?;
+    let secure_cookies = env::var("TALLY_SECURE_COOKIES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_secure(secure_cookies)
+        .with_same_site(SameSite::Strict)
+        .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
+    let auth_layer =
+        AuthManagerLayerBuilder::new(auth_backend::Backend::new(db.clone()), session_layer).build();
+
     let tl = TrueLayerClient::new(tl_client_id, tl_client_secret, tl_redirect_base.clone())?;
     let notifier = Notifier::from_env();
 
@@ -72,7 +94,9 @@ async fn main() -> Result<()> {
 
     let _sched = scheduler::start_scheduler(state.clone()).await?;
 
-    let app = routes::router(state.clone()).layer(TraceLayer::new_for_http());
+    let app = routes::router(state.clone())
+        .layer(auth_layer)
+        .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
     tracing::info!("tally listening on http://{addr}");
