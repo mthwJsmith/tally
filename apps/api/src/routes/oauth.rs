@@ -1,6 +1,6 @@
 //! OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP endpoint.
 //!
-//! tally is a *resource server* only (see `oidc.rs` and `docs/auth-refactor.md`): it no longer
+//! tally is a *resource server* only (see `oidc.rs`): it no longer
 //! runs an authorization server. This document points MCP clients at the external IdP
 //! (Authentik/Keycloak) that issues access tokens. When `TALLY_OIDC_ISSUER` is unset,
 //! `authorization_servers` is empty and `/mcp` accepts only legacy API tokens.

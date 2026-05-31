@@ -33,6 +33,9 @@ SECRETS.local.md
 *.tmp
 coverage/
 
+# Internal notes (not for public release)
+docs/
+
 # Editor / OS
 *.swp
 .DS_Store

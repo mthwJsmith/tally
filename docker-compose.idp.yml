@@ -10,7 +10,8 @@
 # Required env (add to .env): PG_PASS, AUTHENTIK_SECRET_KEY
 #   AUTHENTIK_SECRET_KEY: `openssl rand -base64 60`
 #   PG_PASS:              `openssl rand -base64 36`
-# Then finish setup in the Authentik UI — see docs/zero-trust-authentik.md.
+# Then finish setup in the Authentik UI: create an OAuth2/OIDC provider whose issuer/audience
+# match TALLY_OIDC_ISSUER/TALLY_OIDC_AUDIENCE, and (optionally) a proxy provider for forward-auth.
 
 services:
   authentik-postgresql:

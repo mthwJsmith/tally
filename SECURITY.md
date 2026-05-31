@@ -31,8 +31,8 @@ dependencies (report those upstream, though we welcome a heads-up).
 tally is self-hosted; a secure deployment depends on the operator:
 
 - Put it behind a **TLS-terminating reverse proxy** and set `TALLY_SECURE_COOKIES=true`.
-- For internet exposure, front the web UI with an **IdP / zero-trust forward-auth**
-  (see `docs/zero-trust-authentik.md`).
+- For internet exposure, front the web UI with a zero-trust layer (Cloudflare Access) or an
+  **IdP / forward-auth** (Authentik, Authelia, Keycloak). See the README's security section.
 - Keep `TALLY_MASTER_KEY` and `.env` secret and backed up; never commit them.
 - Treat API tokens and IdP credentials as full-access secrets.
 
