@@ -117,3 +117,46 @@ pub async fn validate(cfg: &OidcConfig, token: &str) -> Option<Claims> {
     let data = decode::<Claims>(token, &key, &validation).ok()?;
     Some(data.claims)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims(scope: &str, scp: &[&str]) -> Claims {
+        Claims {
+            sub: "u".into(),
+            scope: scope.into(),
+            scp: scp.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn has_scope_reads_space_delimited_and_array() {
+        let c = claims("read write", &[]);
+        assert!(c.has_scope("read"));
+        assert!(c.has_scope("write"));
+        assert!(!c.has_scope("admin"));
+
+        let c2 = claims("", &["read"]);
+        assert!(c2.has_scope("read"));
+        assert!(!c2.has_scope("write")); // read-only token must NOT grant write
+
+        assert!(!claims("", &[]).has_scope("read")); // no scope → nothing
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_malformed_tokens_without_network() {
+        let cfg = OidcConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "aud".into(),
+            // unroutable — proves these rejections happen before any JWKS fetch
+            jwks_url: "http://127.0.0.1:1/jwks".into(),
+        };
+        assert!(validate(&cfg, "not-a-jwt").await.is_none());
+        assert!(validate(&cfg, "").await.is_none());
+        // alg:"none" header fails to parse / has no kid → rejected, no fetch attempted
+        assert!(validate(&cfg, "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJ4In0.")
+            .await
+            .is_none());
+    }
+}

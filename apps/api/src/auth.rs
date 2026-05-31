@@ -248,3 +248,68 @@ pub async fn touch_last_login(db: &Db, user_id: i64) -> Result<()> {
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Crypto;
+    use crate::db::Db;
+    use base64::engine::general_purpose::STANDARD as B64STD;
+
+    async fn fetch_user(db: &Db, id: i64) -> User {
+        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// In-memory DB with migrations applied. `max_connections(1)` keeps the single shared
+    /// `:memory:` database alive across queries.
+    async fn test_db() -> Db {
+        let crypto = Crypto::from_b64(&B64STD.encode([7u8; 32])).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        Db { pool, crypto }
+    }
+
+    #[test]
+    fn password_hash_roundtrip() {
+        let h = hash_password("correct horse battery staple").unwrap();
+        assert!(verify_password("correct horse battery staple", &h));
+        assert!(!verify_password("wrong", &h));
+    }
+
+    #[tokio::test]
+    async fn totp_code_cannot_be_replayed() {
+        let db = test_db().await;
+        let uid = create_user(&db, "alice", "a-strong-password").await.unwrap();
+        let secret = fresh_totp_secret();
+        save_totp_secret(&db, uid, &secret, &new_recovery_codes(2))
+            .await
+            .unwrap();
+
+        let user = fetch_user(&db, uid).await;
+        let totp = make_totp(&secret, &user.username).unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let code = totp.generate((now / 30) * 30);
+
+        // First presentation succeeds and records the step.
+        assert!(verify_totp_fresh(&db, &user, &code).await.unwrap());
+
+        // Same code, replayed against the now-updated user → rejected.
+        let user_after = fetch_user(&db, uid).await;
+        assert!(user_after.last_totp_step > 0);
+        assert!(
+            !verify_totp_fresh(&db, &user_after, &code).await.unwrap(),
+            "a TOTP code must not be accepted twice"
+        );
+
+        // A wrong code is rejected.
+        assert!(!verify_totp_fresh(&db, &user_after, "000000").await.unwrap());
+    }
+}

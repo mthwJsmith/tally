@@ -22,6 +22,11 @@ impl Crypto {
     pub fn from_env() -> Result<Self> {
         let raw = std::env::var("TALLY_MASTER_KEY")
             .context("TALLY_MASTER_KEY env var not set — generate with `openssl rand -base64 32`")?;
+        Self::from_b64(raw.trim())
+    }
+
+    /// Build from a base64-encoded 32-byte key. Used by `from_env` and by tests.
+    pub fn from_b64(raw: &str) -> Result<Self> {
         let bytes = B64
             .decode(raw.trim())
             .context("TALLY_MASTER_KEY is not valid base64")?;
@@ -67,18 +72,13 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        std::env::set_var(
-            "TALLY_MASTER_KEY",
-            B64.encode([0u8; 32]),
-        );
-        let c = Crypto::from_env().unwrap();
+        let c = Crypto::from_b64(&B64.encode([0u8; 32])).unwrap();
         let (nonce, ct) = c.encrypt("hello world").unwrap();
         assert_eq!(c.decrypt(&nonce, &ct).unwrap(), "hello world");
     }
 
     #[test]
     fn rejects_wrong_key_length() {
-        std::env::set_var("TALLY_MASTER_KEY", B64.encode([0u8; 16]));
-        assert!(Crypto::from_env().is_err());
+        assert!(Crypto::from_b64(&B64.encode([0u8; 16])).is_err());
     }
 }
