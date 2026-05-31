@@ -143,21 +143,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/callback", get(auth::callback))
         // MCP server (Streamable HTTP) — addable as a Claude/ChatGPT connector.
         .route("/mcp", get(mcp::get_handler).post(mcp::post_handler))
-        // OAuth 2.1 authorization server (for MCP custom connectors).
+        // RFC 9728 Protected Resource Metadata — points MCP clients at the external IdP
+        // that issues tokens. tally is a resource server, not an authorization server.
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth::protected_resource_metadata),
         )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(oauth::authorization_server_metadata),
-        )
-        .route("/oauth/register", post(oauth::register))
-        .route(
-            "/oauth/authorize",
-            get(oauth::authorize_get).post(oauth::authorize_post),
-        )
-        .route("/oauth/token", post(oauth::token))
         .route("/healthz", get(healthz::healthz))
         .nest("/auth", auth_routes)
         .nest("/api", api_routes)

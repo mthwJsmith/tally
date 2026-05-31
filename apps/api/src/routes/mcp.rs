@@ -6,7 +6,7 @@
 //! spec). Auth is a tally API token sent as `Authorization: Bearer <token>` — mint one in
 //! Settings. We never mutate anything here.
 
-use crate::{auth, AppState};
+use crate::{auth, oidc, AppState};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -100,12 +100,16 @@ async fn authed(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(raw) = h.strip_prefix("Bearer ") else {
         return false;
     };
-    let token_hash = auth::hash_api_token(raw.trim());
-    // 1) OAuth access token (Claude app / ChatGPT connectors).
-    if let Ok(Some(_)) = state.db.validate_oauth_token(&token_hash).await {
-        return true;
+    let raw = raw.trim();
+    // 1) OIDC JWT issued by the external authorization server (Authentik/Keycloak) — the
+    //    recommended path for Claude/ChatGPT connectors. tally only validates, never issues.
+    if let Some(cfg) = &state.oidc {
+        if oidc::validate(cfg, raw).await.is_some() {
+            return true;
+        }
     }
     // 2) Legacy static API token (Claude Code / HA / scripts).
+    let token_hash = auth::hash_api_token(raw);
     let row: Result<Option<(i64,)>, _> = sqlx::query_as(
         "SELECT user_id FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
     )
