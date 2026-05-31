@@ -1,10 +1,11 @@
 //! Minimal MCP server over the Streamable-HTTP transport.
 //!
-//! Exposes a small set of READ-ONLY tools so AI clients (Claude / Claude Code / claude.ai
-//! custom connector) can query tally. Single endpoint `POST /mcp` speaking JSON-RPC 2.0;
-//! `GET /mcp` returns 405 (we don't offer a server-initiated SSE stream — not required by the
-//! spec). Auth is a tally API token sent as `Authorization: Bearer <token>` — mint one in
-//! Settings. We never mutate anything here.
+//! Exposes a small set of tools so AI clients (Claude / Claude Code / claude.ai custom
+//! connector) can query tally. Most tools are read-only; `add_investment_activity` mutates and
+//! requires the `write` scope. Single endpoint `POST /mcp` speaking JSON-RPC 2.0; `GET /mcp`
+//! returns 405 (no server-initiated SSE stream — not required by the spec). Auth is either an
+//! OIDC JWT from the configured IdP (scope-gated) or a tally API token (`Authorization: Bearer
+//! <token>`, minted in Settings → full access).
 
 use crate::{auth, oidc, AppState};
 use axum::extract::State;
@@ -27,31 +28,34 @@ pub async fn post_handler(
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    if !authed(&state, &headers).await {
-        // 401 + WWW-Authenticate pointing at our protected-resource metadata, so MCP clients
-        // can discover the OAuth authorization server and start the flow.
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("localhost:3001");
-        let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-            "http"
-        } else {
-            "https"
-        };
-        let www = format!(
-            "Bearer resource_metadata=\"{scheme}://{host}/.well-known/oauth-protected-resource\""
-        );
-        let mut resp = (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized", "error_description": "missing or invalid token"})),
-        )
-            .into_response();
-        if let Ok(v) = axum::http::HeaderValue::from_str(&www) {
-            resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+    let auth_ctx = match authed(&state, &headers).await {
+        Some(ctx) => ctx,
+        None => {
+            // 401 + WWW-Authenticate pointing at our protected-resource metadata, so MCP clients
+            // can discover the authorization server and start the flow.
+            let host = headers
+                .get(header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("localhost:3001");
+            let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
+                "http"
+            } else {
+                "https"
+            };
+            let www = format!(
+                "Bearer resource_metadata=\"{scheme}://{host}/.well-known/oauth-protected-resource\""
+            );
+            let mut resp = (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized", "error_description": "missing or invalid token"})),
+            )
+                .into_response();
+            if let Ok(v) = axum::http::HeaderValue::from_str(&www) {
+                resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+            }
+            return resp;
         }
-        return resp;
-    }
+    };
     let req = match body {
         Some(Json(v)) => v,
         None => return rpc_error_response(Value::Null, -32700, "empty body"),
@@ -76,6 +80,13 @@ pub async fn post_handler(
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            if is_write_tool(name) && !auth_ctx.write {
+                return rpc_error_response(
+                    id,
+                    -32000,
+                    "this token lacks the 'write' scope required for this tool",
+                );
+            }
             match call_tool(&state, name, &args).await {
                 Ok(v) => rpc_ok(
                     id,
@@ -93,22 +104,30 @@ pub async fn post_handler(
     }
 }
 
-async fn authed(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(h) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let Some(raw) = h.strip_prefix("Bearer ") else {
-        return false;
-    };
-    let raw = raw.trim();
-    // 1) OIDC JWT issued by the external authorization server (Authentik/Keycloak) — the
-    //    recommended path for Claude/ChatGPT connectors. tally only validates, never issues.
+/// Authentication outcome for an MCP request. `write` gates mutating tools.
+#[derive(Clone, Copy)]
+struct AuthCtx {
+    write: bool,
+}
+
+/// Tools that mutate state and therefore require `write` capability.
+fn is_write_tool(name: &str) -> bool {
+    matches!(name, "add_investment_activity")
+}
+
+async fn authed(state: &AppState, headers: &HeaderMap) -> Option<AuthCtx> {
+    let h = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    let raw = h.strip_prefix("Bearer ")?.trim();
+    // 1) OIDC JWT from the external IdP (Authentik/Keycloak). Reads are allowed for any valid
+    //    token; writes require an explicit `write` scope on the token.
     if let Some(cfg) = &state.oidc {
-        if oidc::validate(cfg, raw).await.is_some() {
-            return true;
+        if let Some(claims) = oidc::validate(cfg, raw).await {
+            return Some(AuthCtx {
+                write: claims.has_scope("write"),
+            });
         }
     }
-    // 2) Legacy static API token (Claude Code / HA / scripts).
+    // 2) Legacy static API token, minted by the authenticated owner in Settings → full access.
     let token_hash = auth::hash_api_token(raw);
     let row: Result<Option<(i64,)>, _> = sqlx::query_as(
         "SELECT user_id FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
@@ -122,10 +141,9 @@ async fn authed(state: &AppState, headers: &HeaderMap) -> bool {
             .bind(&token_hash)
             .execute(&state.db.pool)
             .await;
-        true
-    } else {
-        false
+        return Some(AuthCtx { write: true });
     }
+    None
 }
 
 fn tool_defs() -> Value {

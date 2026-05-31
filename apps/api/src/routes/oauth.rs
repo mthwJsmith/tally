@@ -40,6 +40,6 @@ pub async fn protected_resource_metadata(
         "resource": format!("{base}/mcp"),
         "authorization_servers": authorization_servers,
         "bearer_methods_supported": ["header"],
-        "scopes_supported": ["read"]
+        "scopes_supported": ["read", "write"]
     }))
 }
