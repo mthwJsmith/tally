@@ -53,7 +53,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/budgets/{id}/status", get(api::budgets::status))
         .route("/bills", get(api::bills::list).post(api::bills::create))
         .route("/bills/upcoming", get(api::bills::upcoming))
-        .route("/bills/{id}", delete(api::bills::delete))
+        .route(
+            "/bills/{id}",
+            patch(api::bills::update).delete(api::bills::delete),
+        )
         .route(
             "/reminders",
             get(api::reminders::list).post(api::reminders::create),
@@ -69,8 +72,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(api::watchlist::list).post(api::watchlist::create),
         )
         .route("/watchlist/deals", get(api::watchlist::deals))
+        .route("/watchlist/check", post(api::watchlist::check))
         .route("/watchlist/{id}", delete(api::watchlist::delete))
         .route("/watchlist/{id}/sources", post(api::watchlist::add_source))
+        .route(
+            "/telegram",
+            get(api::telegram::get).put(api::telegram::put),
+        )
+        .route("/telegram/test", post(api::telegram::test))
         .route("/sync/status", get(consents::api_recent_transactions))
         .route("/sync", post(consents::sync_all))
         .merge(csv_routes)

@@ -47,6 +47,16 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
     })?;
     sched.add(watchlist_job).await?;
 
+    // Direct debits due soon: daily Telegram digest at 08:00.
+    let state_clone = state.clone();
+    let bills_job = Job::new_async("0 0 8 * * *", move |_uuid, _l| {
+        let state = state_clone.clone();
+        Box::pin(async move {
+            notify_due_bills(state).await;
+        })
+    })?;
+    sched.add(bills_job).await?;
+
     sched.start().await?;
     info!(cron = %cron_expr, "scheduler started");
     Ok(sched)
@@ -87,6 +97,35 @@ fn fmt_day(ts: i64) -> String {
         .single()
         .map(|d| d.format("%a %e %b").to_string())
         .unwrap_or_default()
+}
+
+/// Daily: Telegram digest of direct debits / bills due in the next few days.
+pub async fn notify_due_bills(state: Arc<AppState>) {
+    let days = 5;
+    let bills = match state.db.list_bills_due_within(days).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("notify_due_bills: {e:#}");
+            return;
+        }
+    };
+    if bills.is_empty() {
+        return;
+    }
+    let mut lines = vec![format!("💸 *Direct debits due in {days} days:*")];
+    for b in bills {
+        let when = b.next_expected_date.map(fmt_day).unwrap_or_default();
+        let amt = if b.expected_amount_max_cents > 0 {
+            format!(" ~£{:.2}", b.expected_amount_max_cents as f64 / 100.0)
+        } else {
+            String::new()
+        };
+        lines.push(format!("• {}{} ({})", b.name, amt, when));
+    }
+    state
+        .notifier
+        .send_telegram_text(&lines.join("\n"), false)
+        .await;
 }
 
 /// Every few hours: poll each watchlist item's sources, store new deals, alert on under-target.
