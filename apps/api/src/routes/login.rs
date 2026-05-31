@@ -138,8 +138,10 @@ pub async fn verify_2fa(
         return Err((StatusCode::UNAUTHORIZED, "no pending 2FA".into()));
     };
     let user = load_user(&state, uid).await?;
-    let secret = auth::decrypt_totp_secret(&state.db, &user).map_err(internal)?;
-    if !auth::verify_totp(&secret, &body.code, &user.username) {
+    let ok = auth::verify_totp_fresh(&state.db, &user, &body.code)
+        .await
+        .map_err(internal)?;
+    if !ok {
         ratelimit::record_failure(&key);
         return Err((StatusCode::UNAUTHORIZED, "invalid code".into()));
     }

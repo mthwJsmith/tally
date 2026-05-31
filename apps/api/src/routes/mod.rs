@@ -8,12 +8,19 @@ pub mod mcp;
 pub mod oauth;
 
 use crate::AppState;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // CSV import accepts a larger body than axum's 2 MB default; cap it explicitly to bound memory.
+    let csv_routes = Router::new()
+        .route("/csv/preview", post(api::csv_import::preview))
+        .route("/csv/commit", post(api::csv_import::commit))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024));
+
     // Authenticated JSON API.
     let api_routes = Router::new()
         .route("/accounts", get(api::accounts::list))
@@ -51,8 +58,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sync", post(consents::sync_all))
         .route("/tokens", get(api::tokens::list).post(api::tokens::create))
         .route("/tokens/:id", delete(api::tokens::revoke))
-        .route("/csv/preview", post(api::csv_import::preview))
-        .route("/csv/commit", post(api::csv_import::commit))
+        .merge(csv_routes)
         .route(
             "/ai/settings",
             get(api::ai::get_settings)
