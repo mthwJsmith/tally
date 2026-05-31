@@ -1282,62 +1282,6 @@ impl Db {
     }
 
     // ============================================================
-    // v2 — API tokens (Bearer, for HA / Claude / MCP)
-    // ============================================================
-
-    pub async fn create_api_token(
-        &self,
-        user_id: i64,
-        name: &str,
-        token_hash: &str,
-        scopes: &str,
-    ) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO api_tokens (user_id, name, token_hash, scopes, created_at)
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(name)
-        .bind(token_hash)
-        .bind(scopes)
-        .bind(Utc::now().timestamp())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
-    }
-
-    /// List tokens (metadata only — never the raw token, which we don't store).
-    pub async fn list_api_tokens(&self, user_id: i64) -> Result<Vec<ApiTokenInfo>> {
-        Ok(sqlx::query_as::<_, ApiTokenInfo>(
-            "SELECT id, name, scopes, created_at, last_used_at, revoked_at
-             FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
-    pub async fn revoke_api_token(&self, user_id: i64, id: i64) -> Result<()> {
-        sqlx::query("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ?")
-            .bind(Utc::now().timestamp())
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// The single admin user's id (tally is single-user). Used to attribute tokens created
-    /// from the authenticated Settings UI without threading the session user through.
-    pub async fn primary_user_id(&self) -> Result<Option<i64>> {
-        Ok(
-            sqlx::query_scalar("SELECT id FROM users ORDER BY id LIMIT 1")
-                .fetch_optional(&self.pool)
-                .await?,
-        )
-    }
-
-    // ============================================================
     // v2 — Holdings / brokers / quotes
     // ============================================================
 

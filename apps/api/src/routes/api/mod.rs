@@ -9,5 +9,4 @@ pub mod csv_import;
 pub mod holdings;
 pub mod rules;
 pub mod tags;
-pub mod tokens;
 pub mod transactions;

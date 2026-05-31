@@ -56,8 +56,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/bills/{id}", delete(api::bills::delete))
         .route("/sync/status", get(consents::api_recent_transactions))
         .route("/sync", post(consents::sync_all))
-        .route("/tokens", get(api::tokens::list).post(api::tokens::create))
-        .route("/tokens/{id}", delete(api::tokens::revoke))
         .merge(csv_routes)
         .route(
             "/ai/settings",
