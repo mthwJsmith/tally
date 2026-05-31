@@ -24,12 +24,12 @@ pub fn router(state: Arc<AppState>) -> Router {
     // Authenticated JSON API.
     let api_routes = Router::new()
         .route("/accounts", get(api::accounts::list))
-        .route("/accounts/:id", patch(api::accounts::patch))
-        .route("/consents/:id/rename", patch(consents::rename))
+        .route("/accounts/{id}", patch(api::accounts::patch))
+        .route("/consents/{id}/rename", patch(consents::rename))
         .route("/transactions", get(api::transactions::list))
         .route("/transactions/summary", get(api::transactions::spending_summary))
         .route(
-            "/transactions/:id",
+            "/transactions/{id}",
             get(api::transactions::get_one).patch(api::transactions::patch),
         )
         .route(
@@ -37,27 +37,27 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(api::categories::list).post(api::categories::create),
         )
         .route(
-            "/categories/:id",
+            "/categories/{id}",
             patch(api::categories::update).delete(api::categories::delete),
         )
         .route("/tags", get(api::tags::list).post(api::tags::create))
         .route("/tags/attach", post(api::tags::attach))
-        .route("/tags/:txn_id/:tag_id", delete(api::tags::detach))
+        .route("/tags/{txn_id}/{tag_id}", delete(api::tags::detach))
         .route("/rules", get(api::rules::list).post(api::rules::create))
-        .route("/rules/:id", delete(api::rules::delete))
-        .route("/rules/:id/toggle", post(api::rules::toggle))
-        .route("/rules/:id/test", post(api::rules::test_one))
+        .route("/rules/{id}", delete(api::rules::delete))
+        .route("/rules/{id}/toggle", post(api::rules::toggle))
+        .route("/rules/{id}/test", post(api::rules::test_one))
         .route("/rules/run-all", post(api::rules::run_all))
         .route("/budgets", get(api::budgets::list).post(api::budgets::create))
-        .route("/budgets/:id", delete(api::budgets::delete))
-        .route("/budgets/:id/status", get(api::budgets::status))
+        .route("/budgets/{id}", delete(api::budgets::delete))
+        .route("/budgets/{id}/status", get(api::budgets::status))
         .route("/bills", get(api::bills::list).post(api::bills::create))
         .route("/bills/upcoming", get(api::bills::upcoming))
-        .route("/bills/:id", delete(api::bills::delete))
+        .route("/bills/{id}", delete(api::bills::delete))
         .route("/sync/status", get(consents::api_recent_transactions))
         .route("/sync", post(consents::sync_all))
         .route("/tokens", get(api::tokens::list).post(api::tokens::create))
-        .route("/tokens/:id", delete(api::tokens::revoke))
+        .route("/tokens/{id}", delete(api::tokens::revoke))
         .merge(csv_routes)
         .route(
             "/ai/settings",
@@ -66,19 +66,19 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .post(api::ai::update_settings)
                 .patch(api::ai::update_settings),
         )
-        .route("/ai/transactions/:id/suggest", post(api::ai::suggest_one))
+        .route("/ai/transactions/{id}/suggest", post(api::ai::suggest_one))
         .route("/ai/transactions/bulk", post(api::ai::bulk))
         // Investments
         .route(
             "/brokers",
             get(api::holdings::list_brokers).post(api::holdings::create_broker),
         )
-        .route("/brokers/:id", delete(api::holdings::delete_broker))
+        .route("/brokers/{id}", delete(api::holdings::delete_broker))
         .route(
             "/holdings",
             get(api::holdings::list_holdings).post(api::holdings::create_holding),
         )
-        .route("/holdings/:id", delete(api::holdings::delete_holding))
+        .route("/holdings/{id}", delete(api::holdings::delete_holding))
         .route("/holdings/sync-quotes", post(api::holdings::sync_quotes))
         .route("/holdings/symbol-search", get(api::holdings::symbol_search))
         .route("/holdings/history", get(api::holdings::symbol_history))
@@ -88,12 +88,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/holdings/net-worth", get(api::holdings::net_worth))
         .route(
-            "/holdings/:id/activities",
+            "/holdings/{id}/activities",
             get(api::holdings::list_activities),
         )
         .route("/activities", post(api::holdings::create_activity))
         .route(
-            "/activities/:id",
+            "/activities/{id}",
             patch(api::holdings::update_activity).delete(api::holdings::delete_activity),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -132,10 +132,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     // (a valid non-awaiting-2fa session or API token) — never publicly reachable.
     let admin_routes = Router::new()
         .route("/consents", get(consents::list).post(consents::create))
-        .route("/consents/:id/sync", post(consents::sync_one))
-        .route("/consents/:id/disable", post(consents::disable))
-        .route("/consents/:id/enable", post(consents::enable))
-        .route("/consents/:id", delete(consents::delete))
+        .route("/consents/{id}/sync", post(consents::sync_one))
+        .route("/consents/{id}/disable", post(consents::disable))
+        .route("/consents/{id}/enable", post(consents::enable))
+        .route("/consents/{id}", delete(consents::delete))
         .route("/admin", get(dashboard::index))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

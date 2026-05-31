@@ -8,14 +8,13 @@ repository = "https://github.com/mthwjsmith/tally"
 
 [dependencies]
 # Web framework
-axum = { version = "0.7", features = ["macros", "tokio"] }
+axum = { version = "0.8", features = ["macros", "tokio"] }
 tokio = { version = "1.40", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "fs", "set-header"] }
-tower-sessions = "0.13"
-tower-sessions-sqlx-store = { version = "0.14", features = ["sqlite"] }
-axum-login = "0.16"
-async-trait = "0.1"
+tower-http = { version = "0.6", features = ["trace", "fs", "set-header", "limit"] }
+tower-sessions = "0.14"
+tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
+axum-login = "0.18"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
@@ -27,9 +26,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Templates (compile-time HTML)
-askama = { version = "0.12", features = ["with-axum"] }
-askama_axum = "0.4"
+# Templates (compile-time HTML); rendered manually via Html(render()) — no axum-coupled crate.
+askama = "0.12"
 
 # Crypto for token-at-rest encryption
 chacha20poly1305 = "0.10"
@@ -63,7 +61,7 @@ serde_urlencoded = "0.7"
 # v2: rule engine, auth, CSV import
 regex = "1"
 totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
-axum-extra = { version = "0.9", features = ["typed-header", "cookie"] }
+axum-extra = { version = "0.10", features = ["typed-header", "cookie"] }
 csv = "1"
 sha2 = "0.10"
 time = "0.3"
