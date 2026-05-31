@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}tally — dashboard{% endblock %}
+{% block content %}
+<section class="hero">
+    <h1>Dashboard</h1>
+    <p class="muted">Multi-bank sync via TrueLayer → Firefly III.</p>
+</section>
+
+<section>
+    <h2>Linked banks</h2>
+    {% if consents.is_empty() %}
+        <div class="empty">
+            No banks linked yet. <a href="/consents">Add your first bank →</a>
+        </div>
+    {% else %}
+        <table class="consents">
+            <thead>
+                <tr>
+                    <th>Bank</th>
+                    <th>Status</th>
+                    <th>Last sync</th>
+                    <th>Consent expires</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for c in consents %}
+                <tr>
+                    <td><strong>{{ c.nickname }}</strong></td>
+                    <td>
+                        {% if c.enabled == 0 %}
+                            <span class="pill grey">disabled</span>
+                        {% else if c.last_sync_status.is_none() %}
+                            <span class="pill yellow">never synced</span>
+                        {% else %}
+                            {% match c.last_sync_status.as_deref() %}
+                            {% when Some with ("success") %}<span class="pill green">healthy</span>
+                            {% when Some with ("partial") %}<span class="pill yellow">partial</span>
+                            {% when Some with ("fail") %}<span class="pill red">failed</span>
+                            {% when _ %}<span class="pill grey">{{ c.last_sync_status.as_deref().unwrap_or("unknown") }}</span>
+                            {% endmatch %}
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% match c.last_sync_at %}
+                        {% when Some with (ts) %}
+                            <span title="unix {{ ts }}">{{ ts }}</span>
+                        {% when None %}—
+                        {% endmatch %}
+                    </td>
+                    <td>
+                        {% match c.consent_expires_at %}
+                        {% when Some with (ts) %}
+                            <span title="unix {{ ts }}">{{ ts }}</span>
+                        {% when None %}—
+                        {% endmatch %}
+                    </td>
+                    <td class="actions">
+                        <form method="post" action="/consents/{{ c.id }}/sync" style="display:inline">
+                            <button type="submit">Sync now</button>
+                        </form>
+                        {% if c.enabled == 1 %}
+                        <form method="post" action="/consents/{{ c.id }}/disable" style="display:inline">
+                            <button type="submit" class="secondary">Disable</button>
+                        </form>
+                        {% else %}
+                        <form method="post" action="/consents/{{ c.id }}/enable" style="display:inline">
+                            <button type="submit" class="secondary">Enable</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% if c.last_sync_error.is_some() %}
+                <tr>
+                    <td colspan="5"><pre class="error">{{ c.last_sync_error.as_deref().unwrap_or("") }}</pre></td>
+                </tr>
+                {% endif %}
+            {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+    <p><a href="/consents" class="btn">Add another bank →</a></p>
+</section>
+
+<section>
+    <h2>Recent sync activity</h2>
+    {% if recent_logs.is_empty() %}
+        <p class="muted">No syncs yet.</p>
+    {% else %}
+        <table class="logs">
+            <thead>
+                <tr><th>Started</th><th>Status</th><th>Accounts</th><th>Imported</th><th>Skipped</th><th>Recurring</th></tr>
+            </thead>
+            <tbody>
+            {% for log in recent_logs %}
+                <tr class="status-{{ log.status }}">
+                    <td>{{ log.started_at }}</td>
+                    <td>{{ log.status }}</td>
+                    <td>{{ log.accounts_synced }}</td>
+                    <td>{{ log.transactions_imported }}</td>
+                    <td>{{ log.transactions_skipped }}</td>
+                    <td>{{ log.recurring_imported }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+</section>
+{% endblock %}

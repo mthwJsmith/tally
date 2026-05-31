@@ -1,0 +1,29 @@
+# tally — self-host docker-compose
+#
+# Run:
+#   1. `cp apps/api/.env.example .env` and fill in values
+#   2. `docker compose up -d --build`
+#   3. open https://localhost:3001 (or your reverse-proxy URL)
+
+services:
+  tally:
+    build: ./apps/api
+    image: tally:local
+    container_name: tally
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - tally-data:/app/data
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3001/healthz"]
+      interval: 60s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    mem_limit: 200m
+
+volumes:
+  tally-data:

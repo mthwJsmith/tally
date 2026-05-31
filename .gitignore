@@ -1,0 +1,40 @@
+# Build output
+apps/api/target/
+apps/web/node_modules/
+apps/web/dist/
+*.tsbuildinfo
+
+# Runtime data (live SQLite DB lives here)
+data/
+
+# Secrets & env — keep .env.example tracked, ignore everything else
+.env
+.env.*
+!.env.example
+SECRETS.local.md
+
+# Credentials / key material (never commit)
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Databases / dumps
+*.db
+*.sqlite
+*.sqlite3
+*.sql.gz
+*.dump
+
+# Logs & scratch
+*.log
+*.bak
+*.orig
+*.tmp
+coverage/
+
+# Editor / OS
+*.swp
+.DS_Store
+.idea/
+.vscode/
