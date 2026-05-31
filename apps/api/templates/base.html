@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}tally{% endblock %}</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <a href="/" class="brand">tally</a>
+            <a href="/consents">consents</a>
+            <a href="/healthz">health</a>
+        </nav>
+    </header>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+    <footer>
+        <small>tally v{{ env!("CARGO_PKG_VERSION") }} · multi-bank UK Open Banking → Firefly III via TrueLayer</small>
+    </footer>
+</body>
+</html>

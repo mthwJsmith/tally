@@ -1,0 +1,369 @@
+//! Minimal MCP server over the Streamable-HTTP transport.
+//!
+//! Exposes a small set of READ-ONLY tools so AI clients (Claude / Claude Code / claude.ai
+//! custom connector) can query tally. Single endpoint `POST /mcp` speaking JSON-RPC 2.0;
+//! `GET /mcp` returns 405 (we don't offer a server-initiated SSE stream — not required by the
+//! spec). Auth is a tally API token sent as `Authorization: Bearer <token>` — mint one in
+//! Settings. We never mutate anything here.
+
+use crate::{auth, AppState};
+use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use chrono::Utc;
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// GET is not supported (no server-push SSE). Spec allows replying 405.
+pub async fn get_handler() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, "MCP: use POST").into_response()
+}
+
+pub async fn post_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if !authed(&state, &headers).await {
+        // 401 + WWW-Authenticate pointing at our protected-resource metadata, so MCP clients
+        // can discover the OAuth authorization server and start the flow.
+        let host = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost:3001");
+        let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
+            "http"
+        } else {
+            "https"
+        };
+        let www = format!(
+            "Bearer resource_metadata=\"{scheme}://{host}/.well-known/oauth-protected-resource\""
+        );
+        let mut resp = (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized", "error_description": "missing or invalid token"})),
+        )
+            .into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&www) {
+            resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+        }
+        return resp;
+    }
+    let req = match body {
+        Some(Json(v)) => v,
+        None => return rpc_error_response(Value::Null, -32700, "empty body"),
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    match method {
+        "initialize" => rpc_ok(
+            id,
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "tally", "version": env!("CARGO_PKG_VERSION") }
+            }),
+        ),
+        // Notifications carry no id and expect no JSON-RPC response body.
+        m if m.starts_with("notifications/") => StatusCode::ACCEPTED.into_response(),
+        "ping" => rpc_ok(id, json!({})),
+        "tools/list" => rpc_ok(id, json!({ "tools": tool_defs() })),
+        "tools/call" => {
+            let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match call_tool(&state, name, &args).await {
+                Ok(v) => rpc_ok(
+                    id,
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": serde_json::to_string_pretty(&v).unwrap_or_default()
+                        }]
+                    }),
+                ),
+                Err(e) => rpc_error_response(id, -32000, &e),
+            }
+        }
+        _ => rpc_error_response(id, -32601, "method not found"),
+    }
+}
+
+async fn authed(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(h) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(raw) = h.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let token_hash = auth::hash_api_token(raw.trim());
+    // 1) OAuth access token (Claude app / ChatGPT connectors).
+    if let Ok(Some(_)) = state.db.validate_oauth_token(&token_hash).await {
+        return true;
+    }
+    // 2) Legacy static API token (Claude Code / HA / scripts).
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+        "SELECT user_id FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.db.pool)
+    .await;
+    if let Ok(Some(_)) = row {
+        let _ = sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?")
+            .bind(Utc::now().timestamp())
+            .bind(&token_hash)
+            .execute(&state.db.pool)
+            .await;
+        true
+    } else {
+        false
+    }
+}
+
+fn tool_defs() -> Value {
+    json!([
+        {
+            "name": "list_accounts",
+            "description": "List all linked bank and card accounts with current balances (in pence/cents).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_transactions",
+            "description": "List recent transactions, newest first. Amounts are in pence/cents; is_credit=1 means money in.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "days": { "type": "integer", "description": "Look back this many days (default 30)." },
+                    "limit": { "type": "integer", "description": "Max rows (default 25, max 200)." },
+                    "query": { "type": "string", "description": "Case-insensitive substring filter on description." }
+                }
+            }
+        },
+        {
+            "name": "spending_summary",
+            "description": "Total outgoing spend grouped by category id over the last N days.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "days": { "type": "integer", "description": "Window length in days (default 30)." }
+                }
+            }
+        },
+        {
+            "name": "list_bills",
+            "description": "List recurring bills / direct debits, including upcoming due dates and expected amounts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "within_days": { "type": "integer", "description": "If set, only bills due within this many days." }
+                }
+            }
+        },
+        {
+            "name": "net_worth",
+            "description": "Investment portfolio market value, cost basis and unrealised gain (in major currency units).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_brokers",
+            "description": "List investment brokers/accounts (id + name), e.g. to pick one for add_investment_activity.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "add_investment_activity",
+            "description": "Record an investment transaction (buy/sell/dividend). Creates the holding on first buy of a symbol. If broker is omitted and only one exists, it is used.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "Ticker, e.g. INTC or VWRP.L" },
+                    "activity_type": { "type": "string", "description": "BUY | SELL | DIVIDEND | SPLIT | FEE | INTEREST (default BUY)" },
+                    "quantity": { "type": "number", "description": "Number of units/shares" },
+                    "price_per_unit": { "type": "number", "description": "Price paid per unit (omit for dividend/fee if N/A)" },
+                    "date": { "type": "string", "description": "ISO date/datetime, e.g. 2026-05-15 or 2026-05-15T18:24. Defaults to now." },
+                    "fee": { "type": "number", "description": "Fee (optional)" },
+                    "currency": { "type": "string", "description": "ISO currency, default GBP" },
+                    "broker_id": { "type": "integer", "description": "Broker id (optional; see list_brokers)" },
+                    "broker_name": { "type": "string", "description": "Broker name to match (optional alternative to broker_id)" },
+                    "name": { "type": "string", "description": "Company/asset name (optional)" },
+                    "notes": { "type": "string" }
+                },
+                "required": ["symbol", "quantity"]
+            }
+        }
+    ])
+}
+
+/// Parse an ISO date/datetime or unix-seconds string to a unix timestamp; None → now.
+fn parse_activity_ts(args: &Value) -> i64 {
+    let now = Utc::now().timestamp();
+    let Some(s) = args.get("date").and_then(|v| v.as_str()) else {
+        return now;
+    };
+    let s = s.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        return n;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.timestamp();
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
+        return dt.and_utc().timestamp();
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+    }
+    now
+}
+
+async fn call_tool(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {
+    let err = |e: anyhow::Error| e.to_string();
+    match name {
+        "list_accounts" => {
+            let accounts = state.db.list_all_enabled_accounts().await.map_err(err)?;
+            Ok(json!({ "accounts": accounts }))
+        }
+        "list_transactions" => {
+            let days = args.get("days").and_then(|v| v.as_i64()).unwrap_or(30).clamp(1, 730);
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(25).clamp(1, 200);
+            let query = args.get("query").and_then(|v| v.as_str());
+            let from = Utc::now().timestamp() - days * 86_400;
+            let txns = state
+                .db
+                .list_transactions(None, None, Some(from), None, None, None, None, query, limit, 0)
+                .await
+                .map_err(err)?;
+            Ok(json!({ "transactions": txns }))
+        }
+        "spending_summary" => {
+            let days = args.get("days").and_then(|v| v.as_i64()).unwrap_or(30).clamp(1, 730);
+            let now = Utc::now().timestamp();
+            let rows = state.db.spending_by_category(now - days * 86_400, now).await.map_err(err)?;
+            let summary: Vec<Value> = rows
+                .into_iter()
+                .map(|(cat, cents)| json!({ "category_id": cat, "total_cents": cents }))
+                .collect();
+            Ok(json!({ "days": days, "by_category": summary }))
+        }
+        "list_bills" => {
+            let bills = match args.get("within_days").and_then(|v| v.as_i64()) {
+                Some(d) => state.db.list_bills_due_within(d.clamp(1, 365)).await.map_err(err)?,
+                None => state.db.list_bills().await.map_err(err)?,
+            };
+            Ok(json!({ "bills": bills }))
+        }
+        "net_worth" => {
+            let holdings = state.db.list_holdings().await.map_err(err)?;
+            let quotes = state.db.all_latest_quotes().await.map_err(err)?;
+            let by_symbol: std::collections::HashMap<_, _> =
+                quotes.iter().map(|q| (q.symbol.clone(), q)).collect();
+            let mut total = 0.0_f64;
+            let mut cost = 0.0_f64;
+            for h in &holdings {
+                if let Some(q) = by_symbol.get(&h.symbol) {
+                    total += q.price * h.quantity;
+                }
+                if let Some(c) = h.avg_cost_per_unit {
+                    cost += c * h.quantity;
+                }
+            }
+            Ok(json!({
+                "holdings_market_value": total,
+                "holdings_cost_basis": cost,
+                "holdings_unrealised_gain": total - cost
+            }))
+        }
+        "list_brokers" => {
+            let brokers = state.db.list_brokers().await.map_err(err)?;
+            Ok(json!({ "brokers": brokers }))
+        }
+        "add_investment_activity" => {
+            let symbol = args
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "symbol required".to_string())?;
+            let quantity = args
+                .get("quantity")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| "quantity required".to_string())?;
+            let activity_type = args
+                .get("activity_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_uppercase())
+                .unwrap_or_else(|| "BUY".to_string());
+            let price = args.get("price_per_unit").and_then(|v| v.as_f64());
+            let fee = args.get("fee").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let currency = args
+                .get("currency")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GBP")
+                .to_uppercase();
+            let notes = args.get("notes").and_then(|v| v.as_str());
+            let name = args.get("name").and_then(|v| v.as_str());
+            let ts = parse_activity_ts(args);
+
+            // Resolve broker: explicit id, else by name, else the sole broker.
+            let brokers = state.db.list_brokers().await.map_err(err)?;
+            let broker_id = if let Some(id) = args.get("broker_id").and_then(|v| v.as_i64()) {
+                id
+            } else if let Some(bn) = args.get("broker_name").and_then(|v| v.as_str()) {
+                brokers
+                    .iter()
+                    .find(|b| b.name.eq_ignore_ascii_case(bn.trim()))
+                    .map(|b| b.id)
+                    .ok_or_else(|| format!("no broker named '{bn}' (use list_brokers)"))?
+            } else if brokers.len() == 1 {
+                brokers[0].id
+            } else {
+                return Err(
+                    "multiple brokers exist — pass broker_id or broker_name (see list_brokers)".into(),
+                );
+            };
+
+            let holding_id = state
+                .db
+                .upsert_holding(broker_id, &symbol, "equity", 0.0, None, &currency, name)
+                .await
+                .map_err(err)?;
+            let activity_id = state
+                .db
+                .create_activity(holding_id, &activity_type, ts, quantity, price, fee, &currency, notes)
+                .await
+                .map_err(err)?;
+            state
+                .db
+                .recompute_holding_from_activities(holding_id)
+                .await
+                .map_err(err)?;
+            Ok(json!({
+                "ok": true,
+                "activity_id": activity_id,
+                "holding_id": holding_id,
+                "symbol": symbol,
+                "activity_type": activity_type,
+                "quantity": quantity,
+                "price_per_unit": price,
+                "broker_id": broker_id,
+            }))
+        }
+        _ => Err(format!("unknown tool: {name}")),
+    }
+}
+
+fn rpc_ok(id: Value, result: Value) -> Response {
+    Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response()
+}
+
+fn rpc_error_response(id: Value, code: i64, message: &str) -> Response {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    }))
+    .into_response()
+}

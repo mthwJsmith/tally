@@ -1,0 +1,224 @@
+/* Tally palette — blend of lisa cream warmth + Maelo editorial green/orange. */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=DM+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Warm base from lisa */
+    --cream: 250 246 240;          /* #faf6f0 */
+    --soft-white: 255 252 247;     /* #fffcf7 */
+    --warm-border: 222 215 203;    /* light warm grey */
+    --ink: 42 31 26;               /* #2a1f1a — warm dark */
+    --mid: 107 90 82;              /* #6b5a52 — warm muted text */
+
+    /* Editorial green from Maelo */
+    --green: 80 94 77;             /* #505E4D */
+    --green-deep: 75 107 90;       /* #4B6B5A */
+    --green-mid: 107 122 99;       /* #6B7A63 */
+    --green-faint: 80 94 77;       /* with alpha for tints */
+
+    /* CTA orange from Maelo */
+    --orange: 198 126 91;          /* #c67e5b */
+    --orange-deep: 184 104 67;     /* #b86843 */
+
+    --danger: 220 38 38;
+    --success: 80 94 77;
+    --warning: 198 126 91;
+
+    /* Functional tokens */
+    --bg: var(--cream);
+    --fg: var(--ink);
+    --muted: var(--mid);
+    --border: var(--warm-border);
+    --card: var(--soft-white);
+    --accent: var(--green);
+    --cta: var(--orange);
+  }
+
+  body {
+    background: rgb(var(--cream));
+    color: rgb(var(--ink));
+    font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    font-feature-settings: "cv02", "cv03", "cv11", "ss01";
+  }
+
+  body::before {
+    /* Subtle warm gradient wash — gentle, not full lisa, not blank Maelo */
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image:
+      radial-gradient(ellipse 800px 600px at 90% -10%, rgba(198, 126, 91, 0.05) 0%, transparent 70%),
+      radial-gradient(ellipse 700px 500px at 5% 105%, rgba(80, 94, 77, 0.06) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  #root {
+    position: relative;
+    z-index: 1;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    line-height: 1.05;
+    color: rgb(var(--ink));
+  }
+
+  /* Editorial accent — green tint on emphasised words */
+  h1 em, h2 em, h3 em {
+    font-style: normal;
+    color: rgb(var(--green));
+    font-weight: 800;
+  }
+}
+
+@layer components {
+  /* Card: sharp 1px border on warm cream */
+  .card {
+    @apply border bg-card;
+    border-color: rgb(var(--warm-border));
+  }
+
+  /* CTA — ink dark on cream, lisa-style (no orange) */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold transition-all;
+    font-family: "Inter", sans-serif;
+  }
+  .btn-cta {
+    @apply btn;
+    background: rgb(var(--ink));
+    color: rgb(var(--cream));
+  }
+  .btn-cta:hover {
+    background: rgb(var(--mid));
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(42, 31, 26, 0.18);
+  }
+  .btn-primary {
+    @apply btn;
+    background: rgb(var(--ink));
+    color: rgb(var(--cream));
+  }
+  .btn-primary:hover {
+    background: rgb(var(--mid));
+  }
+  .btn-outlined {
+    @apply btn border-2;
+    background: transparent;
+    border-color: rgb(var(--green));
+    color: rgb(var(--green));
+  }
+  .btn-outlined:hover {
+    background: rgb(var(--green));
+    color: white;
+  }
+  .btn-secondary {
+    @apply btn border;
+    background: rgb(var(--soft-white));
+    border-color: rgb(var(--warm-border));
+    color: rgb(var(--ink));
+  }
+  .btn-secondary:hover {
+    border-color: rgb(var(--green));
+    color: rgb(var(--green));
+  }
+  .btn-ghost {
+    @apply btn;
+    background: transparent;
+    color: rgb(var(--mid));
+  }
+  .btn-ghost:hover {
+    color: rgb(var(--ink));
+    background: rgba(80, 94, 77, 0.06);
+  }
+  .btn-danger {
+    @apply btn text-white;
+    background: rgb(var(--danger));
+  }
+
+  .input {
+    @apply w-full border px-3.5 py-2.5 text-sm placeholder:opacity-50 focus:outline-none;
+    border-color: rgb(var(--warm-border));
+    background: rgb(var(--soft-white));
+    color: rgb(var(--ink));
+    font-family: "Inter", sans-serif;
+  }
+  .input:focus {
+    border-color: rgb(var(--green));
+    box-shadow: 0 0 0 3px rgba(80, 94, 77, 0.12);
+  }
+
+  /* Pills — small editorial tags */
+  .pill {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider;
+  }
+  .pill-green {
+    @apply pill;
+    background: rgba(80, 94, 77, 0.1);
+    color: rgb(var(--green));
+  }
+  .pill-orange {
+    @apply pill;
+    background: rgba(80, 94, 77, 0.12);
+    color: rgb(var(--green));
+  }
+  .pill-warm {
+    @apply pill;
+    background: rgba(42, 31, 26, 0.06);
+    color: rgb(var(--ink));
+  }
+  .pill-grey {
+    @apply pill;
+    background: rgba(107, 90, 82, 0.1);
+    color: rgb(var(--mid));
+  }
+  .pill-ink {
+    @apply pill;
+    background: rgb(var(--ink));
+    color: rgb(var(--cream));
+  }
+
+  /* Hero dark panel — used sparingly for splash sections only */
+  .panel-dark {
+    background: linear-gradient(135deg, rgb(var(--green-deep)), rgb(var(--green-mid)), rgb(var(--green)));
+    color: rgb(247, 246, 218);
+  }
+  .panel-dark h1, .panel-dark h2 { color: rgb(247, 246, 218); }
+  .panel-dark h1 em, .panel-dark h2 em { color: rgb(255, 222, 200); }
+
+  .mono { font-family: "DM Mono", ui-monospace, "Menlo", monospace; }
+}
+
+@layer utilities {
+  .text-green { color: rgb(var(--green)); }
+  .text-green-deep { color: rgb(var(--green-deep)); }
+  .text-orange { color: rgb(var(--orange-deep)); }
+  .text-cream { color: rgb(var(--cream)); }
+  .text-ink { color: rgb(var(--ink)); }
+  .text-mid { color: rgb(var(--mid)); }
+  .bg-cream { background: rgb(var(--cream)); }
+  .bg-soft { background: rgb(var(--soft-white)); }
+  .bg-green { background: rgb(var(--green)); }
+  .bg-green-deep { background: rgb(var(--green-deep)); }
+  .bg-ink { background: rgb(var(--ink)); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in { animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.fade-in-1 { animation: fadeIn 0.6s 0.1s cubic-bezier(0.16, 1, 0.3, 1) both; opacity: 0; }
+.fade-in-2 { animation: fadeIn 0.6s 0.2s cubic-bezier(0.16, 1, 0.3, 1) both; opacity: 0; }
+.fade-in-3 { animation: fadeIn 0.6s 0.3s cubic-bezier(0.16, 1, 0.3, 1) both; opacity: 0; }
+.fade-in-4 { animation: fadeIn 0.6s 0.4s cubic-bezier(0.16, 1, 0.3, 1) both; opacity: 0; }
+.fade-in-5 { animation: fadeIn 0.6s 0.5s cubic-bezier(0.16, 1, 0.3, 1) both; opacity: 0; }

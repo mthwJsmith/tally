@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}tally — consents{% endblock %}
+{% block content %}
+<section class="hero">
+    <h1>Linked banks</h1>
+    <p class="muted">Each bank = one OAuth consent with TrueLayer. Consents expire every 90 days per PSD2 — re-add then.</p>
+</section>
+
+<section>
+    <h2>Add a bank</h2>
+    <form method="post" action="/consents" class="add-bank">
+        <label>
+            Nickname
+            <input name="nickname" placeholder="e.g. nationwide, santander, chase, aqua" required pattern="[a-z0-9_-]+" />
+        </label>
+        <p class="muted">Use lowercase letters, numbers, dashes. The nickname is just a label for you — the OAuth callback URL is the same for every bank (your <code>TALLY_REDIRECT_URI_BASE</code> + <code>/callback</code>).</p>
+        <button type="submit">Start OAuth flow →</button>
+    </form>
+</section>
+
+<section>
+    <h2>Existing consents</h2>
+    {% if consents.is_empty() %}
+        <p class="muted">No consents yet.</p>
+    {% else %}
+        <ul class="consent-list">
+        {% for c in consents %}
+            <li>
+                <strong>{{ c.nickname }}</strong>
+                {% if c.provider_display_name.is_some() %}
+                    <span class="muted">— {{ c.provider_display_name.as_deref().unwrap_or("") }}</span>
+                {% endif %}
+                {% if c.enabled == 0 %}<span class="pill grey">disabled</span>{% endif %}
+                <form method="post" action="/consents/{{ c.id }}" style="display:inline; margin-left: 1em;" onsubmit="return confirm('Delete consent {{ c.nickname }}? Bank link is removed; transactions already in Firefly stay.');">
+                    <input type="hidden" name="_method" value="delete" />
+                    <button type="submit" class="danger small">Delete</button>
+                </form>
+            </li>
+        {% endfor %}
+        </ul>
+    {% endif %}
+</section>
+{% endblock %}
