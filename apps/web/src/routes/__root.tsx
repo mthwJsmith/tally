@@ -21,6 +21,8 @@ import {
   Settings,
   LogOut,
   LineChart,
+  AlarmClock,
+  Tag,
 } from "lucide-react";
 
 export const Route = createRootRouteWithContext<{
@@ -105,6 +107,12 @@ function RootLayout() {
             icon={<CalendarClock className="size-[18px]" />}
           >
             Bills
+          </NavItem>
+          <NavItem to="/reminders" icon={<AlarmClock className="size-[18px]" />}>
+            Reminders
+          </NavItem>
+          <NavItem to="/watchlist" icon={<Tag className="size-[18px]" />}>
+            Watchlist
           </NavItem>
           <NavItem to="/banks" icon={<Landmark className="size-[18px]" />}>
             Banks

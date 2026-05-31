@@ -112,7 +112,10 @@ struct AuthCtx {
 
 /// Tools that mutate state and therefore require `write` capability.
 fn is_write_tool(name: &str) -> bool {
-    matches!(name, "add_investment_activity")
+    matches!(
+        name,
+        "add_investment_activity" | "add_reminder" | "tick_reminder" | "add_watchlist_item"
+    )
 }
 
 async fn authed(state: &AppState, headers: &HeaderMap) -> Option<AuthCtx> {
@@ -195,6 +198,64 @@ fn tool_defs() -> Value {
                     "notes": { "type": "string" }
                 },
                 "required": ["symbol", "quantity"]
+            }
+        },
+        {
+            "name": "list_reminders",
+            "description": "List active reminders/checklist items (Help to Save, card due dates, etc.) with due dates and whether completed this period.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "add_reminder",
+            "description": "Create a recurring reminder/checklist item. freq is hours|days|weeks|months; due_at is the unix timestamp of the first deadline.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "freq": { "type": "string", "description": "hours | days | weeks | months" },
+                    "every_n": { "type": "integer", "description": "every N of freq (default 1)" },
+                    "anchor_day": { "type": "integer", "description": "day-of-month for monthly, e.g. 28" },
+                    "due_at": { "type": "integer", "description": "unix seconds of the first deadline" },
+                    "notify_before": { "type": "integer", "description": "seconds before due to notify, e.g. 86400 for a day" },
+                    "notes": { "type": "string" }
+                },
+                "required": ["title", "freq", "due_at"]
+            }
+        },
+        {
+            "name": "tick_reminder",
+            "description": "Mark a reminder done for the current period.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "reminder_id": { "type": "integer" } },
+                "required": ["reminder_id"]
+            }
+        },
+        {
+            "name": "list_watchlist",
+            "description": "List deal-watchlist items the user is tracking, with target prices.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_deals",
+            "description": "List recently found deals/prices across the watchlist, newest first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "description": "max rows (default 50)" } }
+            }
+        },
+        {
+            "name": "add_watchlist_item",
+            "description": "Add an item to the deal watchlist with an optional target price (pence) and RSS feed URLs to poll (e.g. a HotUKDeals search.rss URL).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "keywords": { "type": "string" },
+                    "target_price_cents": { "type": "integer", "description": "alert when a found price is at/under this (pence)" },
+                    "rss_urls": { "type": "array", "items": { "type": "string" }, "description": "RSS feed URLs to poll" }
+                },
+                "required": ["name"]
             }
         }
     ])
@@ -353,6 +414,71 @@ async fn call_tool(state: &AppState, name: &str, args: &Value) -> Result<Value, 
                 "price_per_unit": price,
                 "broker_id": broker_id,
             }))
+        }
+        "list_reminders" => {
+            let reminders = state.db.list_reminders().await.map_err(err)?;
+            Ok(json!({ "reminders": reminders }))
+        }
+        "add_reminder" => {
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "title required".to_string())?;
+            let freq = args.get("freq").and_then(|v| v.as_str()).unwrap_or("days");
+            let every_n = args.get("every_n").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
+            let anchor_day = args.get("anchor_day").and_then(|v| v.as_i64());
+            let due_at = args
+                .get("due_at")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "due_at (unix seconds) required".to_string())?;
+            let notify_before = args.get("notify_before").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+            let notes = args.get("notes").and_then(|v| v.as_str());
+            let id = state
+                .db
+                .create_reminder(title, notes, freq, every_n, anchor_day, due_at, notify_before, true)
+                .await
+                .map_err(err)?;
+            Ok(json!({ "ok": true, "id": id }))
+        }
+        "tick_reminder" => {
+            let id = args
+                .get("reminder_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "reminder_id required".to_string())?;
+            state.db.tick_reminder(id).await.map_err(err)?;
+            Ok(json!({ "ok": true }))
+        }
+        "list_watchlist" => {
+            let items = state.db.list_watchlist().await.map_err(err)?;
+            Ok(json!({ "items": items }))
+        }
+        "list_deals" => {
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+            let deals = state.db.recent_deals(limit).await.map_err(err)?;
+            Ok(json!({ "deals": deals }))
+        }
+        "add_watchlist_item" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "name required".to_string())?;
+            let keywords = args.get("keywords").and_then(|v| v.as_str());
+            let target = args.get("target_price_cents").and_then(|v| v.as_i64());
+            let id = state
+                .db
+                .create_watchlist_item(name, keywords, target, "GBP")
+                .await
+                .map_err(err)?;
+            if let Some(urls) = args.get("rss_urls").and_then(|v| v.as_array()) {
+                for u in urls.iter().filter_map(|v| v.as_str()) {
+                    let _ = state.db.add_watchlist_source(id, "rss", u.trim()).await;
+                }
+            }
+            Ok(json!({ "ok": true, "id": id }))
         }
         _ => Err(format!("unknown tool: {name}")),
     }
