@@ -1,9 +1,8 @@
 use crate::importer::Importer;
 use crate::AppState;
 use askama::Template;
-use askama_axum::IntoResponse;
 use axum::extract::{Form, Path, State};
-use axum::response::Redirect;
+use axum::response::{Html, Redirect};
 use axum::Json;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
@@ -17,9 +16,10 @@ pub struct ConsentsTemplate {
     pub consents: Vec<crate::models::Consent>,
 }
 
-pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list(State(state): State<Arc<AppState>>) -> Html<String> {
     let consents = state.db.list_consents().await.unwrap_or_default();
-    ConsentsTemplate { consents }
+    let tmpl = ConsentsTemplate { consents };
+    Html(tmpl.render().unwrap_or_else(|e| format!("template error: {e}")))
 }
 
 #[derive(Deserialize)]

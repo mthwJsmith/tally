@@ -8,7 +8,6 @@
 
 use crate::auth::{self, User};
 use crate::db::Db;
-use async_trait::async_trait;
 use axum_login::{AuthUser, AuthnBackend, UserId};
 
 impl AuthUser for User {
@@ -42,7 +41,6 @@ pub struct Credentials {
     pub password: String,
 }
 
-#[async_trait]
 impl AuthnBackend for Backend {
     type User = User;
     type Credentials = Credentials;
