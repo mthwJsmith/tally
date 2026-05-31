@@ -1,0 +1,46 @@
+# tally - optional deal-watchlist scraper overlay (changedetection.io + a real browser).
+#
+# changedetection.io does the hard per-URL price scraping; tally polls its REST API and folds the
+# prices into your watchlist, MCP, and alerts. It is paired with a Playwright/Chromium browser
+# server so it can render JS and get past bot detection. (Avoid changedetection's bundled
+# Sockpuppet image; it is outdated and carries CVEs.)
+#
+# Run alongside tally:
+#   docker compose -f docker-compose.yml -f docker-compose.deals.yml up -d
+#
+# Then open http://localhost:5000, create an API key under Settings -> API, and set
+# TALLY_CHANGEDETECTION_URL + TALLY_CHANGEDETECTION_API_KEY in tally's .env.
+
+services:
+  changedetection:
+    image: ghcr.io/dgtlmoon/changedetection.io
+    container_name: changedetection
+    restart: unless-stopped
+    environment:
+      - PLAYWRIGHT_DRIVER_URL=ws://playwright-chrome:3000
+      - BASE_URL=http://localhost:5000
+    volumes:
+      - changedetection-data:/datastore
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      - playwright-chrome
+    security_opt:
+      - no-new-privileges:true
+
+  playwright-chrome:
+    # A real headless Chromium for JS rendering / bot-detection resilience. browserless/chrome
+    # listens on :3000; swap for another Playwright server if you prefer.
+    image: browserless/chrome
+    container_name: playwright-chrome
+    restart: unless-stopped
+    environment:
+      - SCREEN_WIDTH=1920
+      - SCREEN_HEIGHT=1024
+      - MAX_CONCURRENT_SESSIONS=3
+      - CONNECTION_TIMEOUT=300000
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  changedetection-data:
