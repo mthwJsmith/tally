@@ -3,8 +3,7 @@
 //! A per-key failure counter with progressive lockout, held in a single global map.
 //! No external dependencies — `std::sync::LazyLock` + `Mutex`. This is sized for a
 //! single-instance, self-hosted deployment; if you run multiple replicas, rely on the
-//! reverse-proxy / IdP rate limiter in front (see docs/auth-refactor.md) instead, since
-//! this state is per-process.
+//! reverse-proxy / IdP rate limiter in front instead, since this state is per-process.
 //!
 //! Keys are caller-defined and SHOULD include the client IP so that a single abusive
 //! source is locked out without locking out the legitimate user from another network.
