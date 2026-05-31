@@ -83,17 +83,6 @@ pub struct Account {
     pub pending_net_cents: Option<i64>,
 }
 
-/// API token metadata for the Settings UI — never includes the raw token (only a hash is stored).
-#[derive(Debug, Clone, FromRow, Serialize)]
-pub struct ApiTokenInfo {
-    pub id: i64,
-    pub name: String,
-    pub scopes: String,
-    pub created_at: i64,
-    pub last_used_at: Option<i64>,
-    pub revoked_at: Option<i64>,
-}
-
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct RecurringEntry {
     pub id: i64,

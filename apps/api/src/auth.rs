@@ -17,7 +17,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 use totp_rs::{Algorithm, Secret, TOTP};
 
@@ -56,12 +55,6 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
-}
-
-pub fn hash_api_token(raw: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(raw.as_bytes());
-    B64.encode(h.finalize())
 }
 
 pub fn new_recovery_codes(n: usize) -> Vec<String> {

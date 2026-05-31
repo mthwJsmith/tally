@@ -9,20 +9,9 @@ import {
   AlertTriangle,
   Plug,
   Copy,
-  Trash2,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { formatDate } from "@/lib/format";
 import type { MeResponse } from "@/types/api";
-
-type ApiToken = {
-  id: number;
-  name: string;
-  scopes: string;
-  created_at: number;
-  last_used_at: number | null;
-  revoked_at: number | null;
-};
 
 export const Route = createFileRoute("/settings")({ component: SettingsPage });
 
@@ -49,7 +38,6 @@ function SettingsPage() {
       <TwoFactorSection enrolled={!!me.data?.totp_enrolled} />
       <AiSettingsSection />
       <McpConnectSection />
-      <ApiTokensSection />
     </div>
   );
 }
@@ -118,122 +106,6 @@ function McpConnectSection() {
         Claude app &amp; ChatGPT need their connector/developer mode (Pro/Plus and up). The
         OAuth login screen is your normal Tally username, password and 2FA.
       </p>
-    </section>
-  );
-}
-
-function ApiTokensSection() {
-  const qc = useQueryClient();
-  const tokens = useQuery({
-    queryKey: ["api-tokens"],
-    queryFn: () => api.get<{ tokens: ApiToken[] }>("/api/tokens"),
-  });
-  const [name, setName] = useState("");
-  const [fresh, setFresh] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-
-  const create = useMutation({
-    mutationFn: () =>
-      api.post<{ token: string }>("/api/tokens", { name: name.trim(), scopes: "read" }),
-    onSuccess: (r) => {
-      setFresh(r.token);
-      setName("");
-      qc.invalidateQueries({ queryKey: ["api-tokens"] });
-    },
-  });
-  const revoke = useMutation({
-    mutationFn: (id: number) => api.delete(`/api/tokens/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["api-tokens"] }),
-  });
-
-  const copyFresh = async () => {
-    if (!fresh) return;
-    await navigator.clipboard.writeText(fresh);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  const active = (tokens.data?.tokens ?? []).filter((t) => !t.revoked_at);
-  const mcpUrl = `${window.location.origin}/mcp`;
-
-  return (
-    <section className="card p-6 space-y-3 fade-in-4">
-      <h2 className="text-lg font-semibold flex items-center gap-2">
-        <Plug className="size-5 text-green" /> API access &amp; Claude connector
-      </h2>
-      <p className="text-sm text-mid">
-        Mint a Bearer token to let Claude, Home Assistant, or scripts read Tally.
-        For the Claude app: add a custom connector pointing at{" "}
-        <span className="mono text-ink">{mcpUrl}</span> and use the token as the
-        Authorization header. The token is shown once — copy it now.
-      </p>
-
-      <form
-        className="flex gap-2 max-w-md"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (name.trim()) create.mutate();
-        }}
-      >
-        <input
-          className="input"
-          placeholder="Token name (e.g. Claude, HA sensor)"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-        <button className="btn-primary shrink-0" disabled={create.isPending}>
-          <KeyRound className="size-4" /> Create
-        </button>
-      </form>
-
-      {fresh && (
-        <div className="border border-green/40 bg-green/5 p-4 space-y-2">
-          <p className="text-sm font-semibold text-green flex items-center gap-1.5">
-            <AlertTriangle className="size-4" /> Copy this token now — it won't be
-            shown again.
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="mono text-xs break-all bg-cream px-2 py-1.5 flex-1">
-              {fresh}
-            </code>
-            <button type="button" className="btn-ghost shrink-0" onClick={copyFresh}>
-              <Copy className="size-3.5" /> {copied ? "Copied ✓" : "Copy"}
-            </button>
-          </div>
-          <button
-            type="button"
-            className="btn-ghost text-xs"
-            onClick={() => setFresh(null)}
-          >
-            I've saved it
-          </button>
-        </div>
-      )}
-
-      {active.length > 0 && (
-        <ul className="divide-y divide-thin border border-thin">
-          {active.map((t) => (
-            <li key={t.id} className="px-4 py-2.5 flex items-center justify-between">
-              <div>
-                <p className="font-semibold text-sm">{t.name}</p>
-                <p className="text-[11px] mono text-mid">
-                  {t.scopes} · created {formatDate(t.created_at)} ·{" "}
-                  {t.last_used_at
-                    ? `last used ${formatDate(t.last_used_at)}`
-                    : "never used"}
-                </p>
-              </div>
-              <button
-                className="btn-ghost text-xs"
-                onClick={() => revoke.mutate(t.id)}
-                title="Revoke"
-              >
-                <Trash2 className="size-3.5" />
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
     </section>
   );
 }
