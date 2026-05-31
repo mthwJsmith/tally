@@ -37,6 +37,12 @@ fn gbp() -> String {
     "GBP".to_string()
 }
 
+/// Build a HotUKDeals keyword-search RSS feed for free-text terms.
+pub fn hukd_feed(query: &str) -> String {
+    let q = serde_urlencoded::to_string([("q", query.trim())]).unwrap_or_default();
+    format!("https://www.hotukdeals.com/search.rss?{q}")
+}
+
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(b): Json<CreateBody>,
@@ -51,7 +57,21 @@ pub async fn create(
         )
         .await
         .map_err(internal)?;
-    for s in b.sources {
+
+    let mut sources = b.sources;
+    // Smart default: if you didn't paste any feeds, auto-watch HotUKDeals for the name
+    // (plus keywords). You type a product, we build the search feed.
+    if sources.is_empty() {
+        let q = match b.keywords.as_deref() {
+            Some(k) if !k.trim().is_empty() => format!("{} {}", b.name.trim(), k.trim()),
+            _ => b.name.trim().to_string(),
+        };
+        sources.push(SourceInput {
+            kind: "rss".to_string(),
+            r#ref: hukd_feed(&q),
+        });
+    }
+    for s in sources {
         state
             .db
             .add_watchlist_source(id, s.kind.trim(), s.r#ref.trim())
