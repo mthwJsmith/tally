@@ -96,9 +96,6 @@ function RootLayout() {
           >
             Categories
           </NavItem>
-          <NavItem to="/rules" icon={<Wand2 className="size-[18px]" />}>
-            Rules
-          </NavItem>
           <NavItem to="/budgets" icon={<Wallet className="size-[18px]" />}>
             Budgets
           </NavItem>

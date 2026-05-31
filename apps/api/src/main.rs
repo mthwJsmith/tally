@@ -95,7 +95,8 @@ async fn main() -> Result<()> {
         AuthManagerLayerBuilder::new(auth_backend::Backend::new(db.clone()), session_layer).build();
 
     let tl = TrueLayerClient::new(tl_client_id, tl_client_secret, tl_redirect_base.clone())?;
-    let notifier = Notifier::from_env();
+    let mut notifier = Notifier::from_env();
+    notifier.db = Some(db.clone()); // let Settings-saved Telegram creds override env
 
     let ai = ai::AiClient::new(db.clone());
     let oidc = oidc::OidcConfig::from_env();

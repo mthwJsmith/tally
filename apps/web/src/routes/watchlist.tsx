@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Plus, Trash2, Tag, ExternalLink } from "lucide-react";
+import { Plus, Trash2, Tag, ExternalLink, RefreshCw, BadgeCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import type { WatchlistItem, WatchlistSource, DealObservation } from "@/types/api";
 
@@ -42,6 +42,10 @@ function WatchlistPage() {
     mutationFn: (id: number) => api.delete(`/api/watchlist/${id}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
   });
+  const checkNow = useMutation({
+    mutationFn: () => api.post("/api/watchlist/check"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+  });
 
   const deals = wl.data?.deals ?? [];
 
@@ -52,13 +56,13 @@ function WatchlistPage() {
           <em>Watchlist</em>
         </h1>
         <p className="text-mid text-sm">
-          Type what you want plus a target price, and tally auto-watches HotUKDeals for it and
-          alerts you when a deal drops to your target. Adding extra feeds is optional.
+          Type what you want and a target price. tally watches for deals and pings you when one
+          drops to your target.
         </p>
       </header>
 
       <form
-        className="card p-5 space-y-2 fade-in-1"
+        className="card p-5 space-y-3 fade-in-1"
         onSubmit={(e) => {
           e.preventDefault();
           if (name.trim()) create.mutate();
@@ -66,7 +70,7 @@ function WatchlistPage() {
       >
         <input
           className="input"
-          placeholder="Item, e.g. Festool TS 55 track saw"
+          placeholder="What do you want? e.g. Festool TS 55 track saw"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
@@ -74,17 +78,26 @@ function WatchlistPage() {
           className="input"
           type="number"
           step="0.01"
-          placeholder="target price £ (optional)"
+          placeholder="Alert me under £…  (optional)"
           value={target}
           onChange={(e) => setTarget(e.target.value)}
         />
-        <textarea
-          className="input"
-          rows={2}
-          placeholder="Optional: extra RSS feed URLs, one per line (HotUKDeals is auto-added for the name)"
-          value={feeds}
-          onChange={(e) => setFeeds(e.target.value)}
-        />
+        <p className="text-[12px] text-green flex items-center gap-1.5">
+          <BadgeCheck className="size-4" /> Automatically watches HotUKDeals for this. No setup
+          needed.
+        </p>
+        <details className="text-sm">
+          <summary className="cursor-pointer text-mid select-none">
+            Advanced: add your own feeds
+          </summary>
+          <textarea
+            className="input mt-2"
+            rows={2}
+            placeholder="Extra RSS feed URLs, one per line (e.g. a CamelCamelCamel Amazon price-drop feed)"
+            value={feeds}
+            onChange={(e) => setFeeds(e.target.value)}
+          />
+        </details>
         <button className="btn-primary" disabled={create.isPending}>
           <Plus className="size-4" /> Watch item
         </button>
@@ -99,9 +112,9 @@ function WatchlistPage() {
               </p>
               <p className="text-[11px] uppercase tracking-widest text-mid mt-0.5">
                 {row.item.target_price_cents != null
-                  ? `target £${(row.item.target_price_cents / 100).toFixed(2)} · `
+                  ? `under £${(row.item.target_price_cents / 100).toFixed(2)} · `
                   : ""}
-                {row.sources.length} source{row.sources.length === 1 ? "" : "s"}
+                watching {row.sources.length} feed{row.sources.length === 1 ? "" : "s"}
               </p>
             </div>
             <button className="btn-ghost text-xs" onClick={() => del.mutate(row.item.id)}>
@@ -112,9 +125,22 @@ function WatchlistPage() {
       </section>
 
       <section className="fade-in-3">
-        <h2 className="text-lg font-semibold mb-2">Recent deals found</h2>
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-lg font-semibold">Deals found</h2>
+          <button
+            className="btn-ghost text-xs"
+            onClick={() => checkNow.mutate()}
+            disabled={checkNow.isPending}
+          >
+            <RefreshCw className={`size-3.5 ${checkNow.isPending ? "animate-spin" : ""}`} />{" "}
+            {checkNow.isPending ? "Checking…" : "Check now"}
+          </button>
+        </div>
         {deals.length === 0 ? (
-          <p className="text-sm text-mid">Nothing yet — the watchlist is polled every few hours.</p>
+          <p className="text-sm text-mid">
+            Nothing yet. Hit "Check now" to poll immediately, or it runs automatically every few
+            hours.
+          </p>
         ) : (
           <ul className="card divide-y divide-thin">
             {deals.map((d) => (

@@ -9,9 +9,14 @@ import {
   AlertTriangle,
   Plug,
   Copy,
+  Send,
+  Wand2,
+  Plus,
+  Trash2,
+  RefreshCw,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { MeResponse } from "@/types/api";
+import type { MeResponse, Category, Rule } from "@/types/api";
 
 export const Route = createFileRoute("/settings")({ component: SettingsPage });
 
@@ -24,7 +29,7 @@ function SettingsPage() {
           <em>Settings</em>
         </h1>
         <p className="text-mid text-sm">
-          Account, two-factor and AI categorisation.
+          Account, two-factor, notifications, AI categorisation and rules.
         </p>
       </header>
 
@@ -36,9 +41,226 @@ function SettingsPage() {
       </section>
 
       <TwoFactorSection enrolled={!!me.data?.totp_enrolled} />
+      <TelegramSection />
       <AiSettingsSection />
+      <RulesSection />
       <McpConnectSection />
     </div>
+  );
+}
+
+function TelegramSection() {
+  const qc = useQueryClient();
+  const tg = useQuery({
+    queryKey: ["telegram"],
+    queryFn: () => api.get<{ configured: boolean; chat_id: string | null }>("/api/telegram"),
+  });
+  const [token, setToken] = useState("");
+  const [chat, setChat] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.put("/api/telegram", { bot_token: token, chat_id: chat || tg.data?.chat_id || "" }),
+    onSuccess: () => {
+      setToken("");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+      qc.invalidateQueries({ queryKey: ["telegram"] });
+    },
+  });
+  const test = useMutation({ mutationFn: () => api.post("/api/telegram/test") });
+
+  return (
+    <section className="card p-6 space-y-3 fade-in-2">
+      <h2 className="text-lg font-semibold flex items-center gap-2">
+        <Send className="size-5 text-green" /> Telegram alerts
+      </h2>
+      <p className="text-sm text-mid">
+        Get reminders, direct-debit nudges and deal alerts on Telegram.
+        {tg.data?.configured ? (
+          <span className="text-green"> Configured ✓ (chat {tg.data.chat_id})</span>
+        ) : (
+          " Not set up yet."
+        )}
+      </p>
+      <details className="text-sm">
+        <summary className="cursor-pointer text-mid select-none">
+          How to get a bot token and chat id
+        </summary>
+        <ol className="list-decimal ml-5 text-mid space-y-0.5 mt-2">
+          <li>
+            On Telegram, message <b>@BotFather</b> → <code className="mono">/newbot</code> → copy
+            the token.
+          </li>
+          <li>
+            Message your new bot once, then open{" "}
+            <code className="mono break-all">
+              https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates
+            </code>{" "}
+            and copy the <b>chat id</b>.
+          </li>
+        </ol>
+      </details>
+      <input
+        className="input"
+        type="password"
+        placeholder={tg.data?.configured ? "Bot token (leave blank to keep current)" : "Bot token"}
+        value={token}
+        onChange={(e) => setToken(e.target.value)}
+      />
+      <input
+        className="input"
+        placeholder={tg.data?.chat_id ? `Chat id (current: ${tg.data.chat_id})` : "Chat id"}
+        value={chat}
+        onChange={(e) => setChat(e.target.value)}
+      />
+      <div className="flex gap-2">
+        <button className="btn-primary" onClick={() => save.mutate()} disabled={save.isPending}>
+          <KeyRound className="size-4" /> {saved ? "Saved ✓" : "Save"}
+        </button>
+        <button
+          className="btn-outlined"
+          onClick={() => test.mutate()}
+          disabled={test.isPending}
+        >
+          Send test
+        </button>
+      </div>
+      {test.isSuccess && <p className="text-xs text-green">Test sent — check Telegram.</p>}
+    </section>
+  );
+}
+
+function RulesSection() {
+  const qc = useQueryClient();
+  const rules = useQuery({
+    queryKey: ["rules"],
+    queryFn: () => api.get<{ rules: Rule[] }>("/api/rules"),
+  });
+  const cats = useQuery({
+    queryKey: ["categories"],
+    queryFn: () => api.get<{ categories: Category[] }>("/api/categories"),
+  });
+  const [name, setName] = useState("");
+  const [desc, setDesc] = useState("");
+  const [merchant, setMerchant] = useState("");
+  const [cat, setCat] = useState<number | "">("");
+  const create = useMutation({
+    mutationFn: () =>
+      api.post("/api/rules", {
+        name,
+        match_description_regex: desc || null,
+        match_merchant_regex: merchant || null,
+        set_category_id: cat || null,
+      }),
+    onSuccess: () => {
+      setName("");
+      setDesc("");
+      setMerchant("");
+      setCat("");
+      qc.invalidateQueries({ queryKey: ["rules"] });
+    },
+  });
+  const del = useMutation({
+    mutationFn: (id: number) => api.delete(`/api/rules/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["rules"] }),
+  });
+  const runAll = useMutation({
+    mutationFn: () => api.post<{ matched: number; mutated: number }>("/api/rules/run-all"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["transactions"] }),
+  });
+
+  return (
+    <section className="card p-6 space-y-3 fade-in-4">
+      <h2 className="text-lg font-semibold flex items-center gap-2">
+        <Wand2 className="size-5 text-green" /> Categorisation rules
+      </h2>
+      <p className="text-sm text-mid">
+        The AI above categorises transactions automatically. Add manual regex rules here only to
+        force specific cases.
+      </p>
+      <details className="text-sm">
+        <summary className="cursor-pointer text-mid select-none">
+          Manual rules ({rules.data?.rules.length ?? 0})
+        </summary>
+        <div className="mt-3 space-y-3">
+          <form
+            className="space-y-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (name.trim()) create.mutate();
+            }}
+          >
+            <input
+              className="input"
+              placeholder="Rule name (e.g. Tesco → Groceries)"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+            <input
+              className="input"
+              placeholder="Description regex (e.g. TESCO|SAINSBURY)"
+              value={desc}
+              onChange={(e) => setDesc(e.target.value)}
+            />
+            <input
+              className="input"
+              placeholder="Merchant regex (optional)"
+              value={merchant}
+              onChange={(e) => setMerchant(e.target.value)}
+            />
+            <select
+              className="input"
+              value={cat}
+              onChange={(e) => setCat(e.target.value ? Number(e.target.value) : "")}
+            >
+              <option value="">Set category</option>
+              {cats.data?.categories.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+            <div className="flex gap-2">
+              <button className="btn-primary" disabled={create.isPending}>
+                <Plus className="size-4" /> Create rule
+              </button>
+              <button
+                type="button"
+                className="btn-outlined"
+                onClick={() => runAll.mutate()}
+                disabled={runAll.isPending}
+              >
+                <RefreshCw className={`size-4 ${runAll.isPending ? "animate-spin" : ""}`} /> Re-apply
+                all
+              </button>
+            </div>
+          </form>
+          {runAll.data && (
+            <p className="text-xs text-green">
+              Matched {runAll.data.matched}, updated {runAll.data.mutated}.
+            </p>
+          )}
+          <ul className="divide-y divide-thin border border-thin rounded">
+            {rules.data?.rules.map((r) => (
+              <li key={r.id} className="px-4 py-2.5 flex items-center justify-between text-sm">
+                <div>
+                  <p className="font-semibold">{r.name}</p>
+                  <p className="text-[11px] mono text-mid">
+                    {r.match_description_regex ?? ""} {r.match_merchant_regex ?? ""} · applied{" "}
+                    {r.times_applied}x
+                  </p>
+                </div>
+                <button className="btn-ghost text-xs" onClick={() => del.mutate(r.id)}>
+                  <Trash2 className="size-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </details>
+    </section>
   );
 }
 

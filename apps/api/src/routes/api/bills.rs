@@ -65,6 +65,37 @@ pub async fn create(
     Ok(Json(json!({ "id": id })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateBody {
+    pub name: Option<String>,
+    pub expected_amount_min_cents: Option<i64>,
+    pub expected_amount_max_cents: Option<i64>,
+    pub next_expected_date: Option<i64>,
+    pub match_description_regex: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+pub async fn update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(b): Json<UpdateBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    state
+        .db
+        .update_bill(
+            id,
+            b.name.as_deref(),
+            b.expected_amount_min_cents,
+            b.expected_amount_max_cents,
+            b.next_expected_date,
+            b.match_description_regex.as_deref(),
+            b.enabled,
+        )
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,

@@ -3,6 +3,7 @@
 use crate::crypto::Crypto;
 use crate::models::*;
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, SqlitePool};
@@ -53,6 +54,42 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Store Telegram bot token (encrypted at rest) + chat id. Empty strings clear them.
+    pub async fn set_telegram_config(&self, token: &str, chat_id: &str) -> Result<()> {
+        let token = token.trim();
+        // Empty token = keep the existing one (the UI never round-trips the secret).
+        if !token.is_empty() {
+            let (nonce, ct) = self.crypto.encrypt(token)?;
+            let v = format!("enc:{}:{}", B64.encode(nonce), B64.encode(ct));
+            self.set_setting("telegram_bot_token", &v).await?;
+        }
+        self.set_setting("telegram_chat_id", chat_id.trim()).await?;
+        Ok(())
+    }
+
+    /// Returns (bot_token, chat_id) from settings, decrypting the token. Either may be None.
+    pub async fn get_telegram_config(&self) -> Result<(Option<String>, Option<String>)> {
+        let token = match self.get_setting("telegram_bot_token").await? {
+            Some(v) if v.starts_with("enc:") => {
+                let parts: Vec<&str> = v.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    match (B64.decode(parts[1]), B64.decode(parts[2])) {
+                        (Ok(nonce), Ok(ct)) => self.crypto.decrypt(&nonce, &ct).ok(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let chat = self
+            .get_setting("telegram_chat_id")
+            .await?
+            .filter(|s| !s.is_empty());
+        Ok((token, chat))
     }
 
     // ---------- consents ----------
@@ -1279,6 +1316,42 @@ impl Db {
         .bind(name_like)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_bill(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        amount_min_cents: Option<i64>,
+        amount_max_cents: Option<i64>,
+        next_expected_date: Option<i64>,
+        match_description_regex: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "UPDATE bills SET
+                name = COALESCE(?, name),
+                expected_amount_min_cents = COALESCE(?, expected_amount_min_cents),
+                expected_amount_max_cents = COALESCE(?, expected_amount_max_cents),
+                next_expected_date = COALESCE(?, next_expected_date),
+                match_description_regex = COALESCE(?, match_description_regex),
+                enabled = COALESCE(?, enabled),
+                updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(name)
+        .bind(amount_min_cents)
+        .bind(amount_max_cents)
+        .bind(next_expected_date)
+        .bind(match_description_regex)
+        .bind(enabled.map(|b| if b { 1 } else { 0 }))
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ============================================================

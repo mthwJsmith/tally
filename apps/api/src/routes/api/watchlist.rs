@@ -107,6 +107,12 @@ pub struct DealsQuery {
     pub limit: Option<i64>,
 }
 
+/// Poll all watchlist sources right now (instead of waiting for the scheduled run).
+pub async fn check(State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode, String)> {
+    crate::scheduler::poll_watchlist(state).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub async fn deals(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DealsQuery>,

@@ -21,6 +21,8 @@ pub struct Notifier {
     pub telegram_token: Option<String>,
     pub telegram_chat: Option<String>,
     pub telegram_min_amount: f64,
+    /// Set after construction so Telegram creds saved in Settings override env vars.
+    pub db: Option<crate::db::Db>,
 }
 
 impl Notifier {
@@ -47,6 +49,7 @@ impl Notifier {
                 .ok()
                 .filter(|s| !s.is_empty()),
             telegram_min_amount,
+            db: None,
         }
     }
 
@@ -116,8 +119,18 @@ impl Notifier {
 
     /// Send an arbitrary Markdown message via Telegram. No-op if Telegram isn't configured.
     /// Used by reminders and deal alerts as well as transaction notifications.
+    /// Resolve Telegram creds: Settings (DB) override env vars.
+    async fn resolve_telegram(&self) -> (Option<String>, Option<String>) {
+        if let Some(db) = &self.db {
+            if let Ok((Some(t), Some(c))) = db.get_telegram_config().await {
+                return (Some(t), Some(c));
+            }
+        }
+        (self.telegram_token.clone(), self.telegram_chat.clone())
+    }
+
     pub async fn send_telegram_text(&self, text: &str, silent: bool) {
-        let (Some(tok), Some(chat)) = (&self.telegram_token, &self.telegram_chat) else {
+        let (Some(tok), Some(chat)) = self.resolve_telegram().await else {
             return;
         };
         let url = format!("https://api.telegram.org/bot{tok}/sendMessage");
