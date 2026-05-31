@@ -64,6 +64,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/reminders/{id}/tick", post(api::reminders::tick))
         .route("/reminders/{id}/untick", post(api::reminders::untick))
+        .route(
+            "/watchlist",
+            get(api::watchlist::list).post(api::watchlist::create),
+        )
+        .route("/watchlist/deals", get(api::watchlist::deals))
+        .route("/watchlist/{id}", delete(api::watchlist::delete))
+        .route("/watchlist/{id}/sources", post(api::watchlist::add_source))
         .route("/sync/status", get(consents::api_recent_transactions))
         .route("/sync", post(consents::sync_all))
         .merge(csv_routes)

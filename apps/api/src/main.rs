@@ -43,6 +43,8 @@ pub struct AppState {
     pub ai: ai::AiClient,
     /// External OIDC authorization server for `/mcp` (None disables the JWT path).
     pub oidc: Option<oidc::OidcConfig>,
+    /// Deal-watchlist price sources (RSS + optional changedetection.io).
+    pub deals: clients::deals::DealsClient,
 }
 
 #[tokio::main]
@@ -101,12 +103,14 @@ async fn main() -> Result<()> {
         Some(c) => tracing::info!("MCP OIDC resource server: issuer={}", c.issuer),
         None => tracing::info!("MCP OIDC disabled (set TALLY_OIDC_ISSUER/AUDIENCE to enable); /mcp uses API tokens only"),
     }
+    let deals = clients::deals::DealsClient::from_env();
     let state = Arc::new(AppState {
         db,
         tl,
         notifier,
         ai,
         oidc,
+        deals,
     });
 
     let _sched = scheduler::start_scheduler(state.clone()).await?;
