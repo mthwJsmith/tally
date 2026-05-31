@@ -7,7 +7,7 @@
 //! OIDC JWT from the configured IdP (scope-gated) or a tally API token (`Authorization: Bearer
 //! <token>`, minted in Settings → full access).
 
-use crate::{auth, oidc, AppState};
+use crate::{oidc, AppState};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -118,32 +118,13 @@ fn is_write_tool(name: &str) -> bool {
 async fn authed(state: &AppState, headers: &HeaderMap) -> Option<AuthCtx> {
     let h = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
     let raw = h.strip_prefix("Bearer ")?.trim();
-    // 1) OIDC JWT from the external IdP (Authentik/Keycloak). Reads are allowed for any valid
-    //    token; writes require an explicit `write` scope on the token.
-    if let Some(cfg) = &state.oidc {
-        if let Some(claims) = oidc::validate(cfg, raw).await {
-            return Some(AuthCtx {
-                write: claims.has_scope("write"),
-            });
-        }
-    }
-    // 2) Legacy static API token, minted by the authenticated owner in Settings → full access.
-    let token_hash = auth::hash_api_token(raw);
-    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
-        "SELECT user_id FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
-    )
-    .bind(&token_hash)
-    .fetch_optional(&state.db.pool)
-    .await;
-    if let Ok(Some(_)) = row {
-        let _ = sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?")
-            .bind(Utc::now().timestamp())
-            .bind(&token_hash)
-            .execute(&state.db.pool)
-            .await;
-        return Some(AuthCtx { write: true });
-    }
-    None
+    // OIDC JWT from the external IdP (Authentik/Keycloak) is the ONLY accepted credential on
+    // /mcp — no legacy API-token fallback. Reads need any valid token; writes need `write` scope.
+    let cfg = state.oidc.as_ref()?;
+    let claims = oidc::validate(cfg, raw).await?;
+    Some(AuthCtx {
+        write: claims.has_scope("write"),
+    })
 }
 
 fn tool_defs() -> Value {

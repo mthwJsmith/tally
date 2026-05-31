@@ -34,6 +34,8 @@ pub struct User {
     pub is_admin: i64,
     pub created_at: i64,
     pub last_login_at: Option<i64>,
+    /// Highest TOTP time-step already consumed — prevents replay within the validity window.
+    pub last_totp_step: i64,
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
@@ -206,6 +208,36 @@ pub fn verify_totp(secret: &[u8], code: &str, account_name: &str) -> bool {
         Ok(totp) => totp.check_current(code.trim()).unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// Verify a login TOTP against the user's stored secret AND enforce single-use: a code is
+/// accepted only if its time-step is strictly newer than the last consumed step, then that step
+/// is recorded. This blocks replay of an intercepted code within its ±1-step validity window.
+pub async fn verify_totp_fresh(db: &Db, user: &User, code: &str) -> Result<bool> {
+    let Ok(secret) = decrypt_totp_secret(db, user) else {
+        return Ok(false);
+    };
+    let Ok(totp) = make_totp(&secret, &user.username) else {
+        return Ok(false);
+    };
+    let code = code.trim();
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let step = now / 30;
+    // Accept the current step and ±1 skew (matching make_totp's skew of 1).
+    for cand in [step.saturating_sub(1), step, step + 1] {
+        if totp.generate(cand * 30) == code {
+            if (cand as i64) <= user.last_totp_step {
+                return Ok(false); // already-used or older step → replay
+            }
+            sqlx::query("UPDATE users SET last_totp_step = ? WHERE id = ?")
+                .bind(cand as i64)
+                .bind(user.id)
+                .execute(&db.pool)
+                .await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn touch_last_login(db: &Db, user_id: i64) -> Result<()> {

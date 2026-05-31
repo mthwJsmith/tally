@@ -112,9 +112,7 @@ async fn main() -> Result<()> {
 
     let app = routes::router(state.clone())
         .layer(auth_layer)
-        // Security headers. `frame-ancestors 'none'` + X-Frame-Options give clickjacking
-        // protection without restricting resource loading (a full resource CSP can be added
-        // once the SPA/htmx asset origins are pinned).
+        // Security headers.
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
@@ -129,7 +127,17 @@ async fn main() -> Result<()> {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("frame-ancestors 'none'"),
+            HeaderValue::from_static(
+                "default-src 'self'; \
+                 img-src 'self' data:; \
+                 style-src 'self' 'unsafe-inline'; \
+                 script-src 'self' https://unpkg.com; \
+                 connect-src 'self'; \
+                 font-src 'self' data:; \
+                 base-uri 'self'; \
+                 form-action 'self'; \
+                 frame-ancestors 'none'",
+            ),
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::STRICT_TRANSPORT_SECURITY,
