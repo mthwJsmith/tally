@@ -11,6 +11,7 @@ mod importer;
 mod middleware;
 mod models;
 mod notifier;
+mod oidc;
 mod ratelimit;
 mod routes;
 mod rules;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub tl: TrueLayerClient,
     pub notifier: Notifier,
     pub ai: ai::AiClient,
+    /// External OIDC authorization server for `/mcp` (None disables the JWT path).
+    pub oidc: Option<oidc::OidcConfig>,
 }
 
 #[tokio::main]
@@ -90,7 +93,18 @@ async fn main() -> Result<()> {
     let notifier = Notifier::from_env();
 
     let ai = ai::AiClient::new(db.clone());
-    let state = Arc::new(AppState { db, tl, notifier, ai });
+    let oidc = oidc::OidcConfig::from_env();
+    match &oidc {
+        Some(c) => tracing::info!("MCP OIDC resource server: issuer={}", c.issuer),
+        None => tracing::info!("MCP OIDC disabled (set TALLY_OIDC_ISSUER/AUDIENCE to enable); /mcp uses API tokens only"),
+    }
+    let state = Arc::new(AppState {
+        db,
+        tl,
+        notifier,
+        ai,
+        oidc,
+    });
 
     let _sched = scheduler::start_scheduler(state.clone()).await?;
 
