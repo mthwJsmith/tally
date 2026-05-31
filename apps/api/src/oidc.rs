@@ -7,7 +7,7 @@
 //! an unknown `kid` (key rotation).
 
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -101,7 +101,17 @@ pub async fn validate(cfg: &OidcConfig, token: &str) -> Option<Claims> {
     let jwk = set.find(&kid)?;
     let key = DecodingKey::from_jwk(jwk).ok()?;
 
-    let mut validation = Validation::new(header.alg);
+    // Pin an asymmetric-only algorithm allowlist rather than trusting the token's own `alg`
+    // header — this prevents algorithm-confusion attacks (e.g. an `HS256` token forged with the
+    // public key). IdPs like Authentik/Keycloak sign with RS256 by default.
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.algorithms = vec![
+        Algorithm::RS256,
+        Algorithm::RS384,
+        Algorithm::RS512,
+        Algorithm::ES256,
+        Algorithm::ES384,
+    ];
     validation.set_issuer(&[cfg.issuer.as_str()]);
     validation.set_audience(&[cfg.audience.as_str()]);
     let data = decode::<Claims>(token, &key, &validation).ok()?;
