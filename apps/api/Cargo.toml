@@ -11,8 +11,11 @@ repository = "https://github.com/mthwjsmith/tally"
 axum = { version = "0.7", features = ["macros", "tokio"] }
 tokio = { version = "1.40", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "fs"] }
+tower-http = { version = "0.6", features = ["trace", "fs", "set-header"] }
 tower-sessions = "0.13"
+tower-sessions-sqlx-store = { version = "0.14", features = ["sqlite"] }
+axum-login = "0.16"
+async-trait = "0.1"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }

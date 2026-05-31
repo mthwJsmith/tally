@@ -95,15 +95,25 @@ pub fn router(state: Arc<AppState>) -> Router {
             crate::middleware::require_auth,
         ));
 
-    let auth_routes = Router::new()
+    // Public auth endpoints (no established session required).
+    let public_auth = Router::new()
         .route("/me", get(login::me))
         .route("/setup", post(login::setup))
         .route("/login", post(login::login))
         .route("/verify-2fa", post(login::verify_2fa))
-        .route("/recovery", post(login::recovery))
+        .route("/recovery", post(login::recovery));
+    // Auth endpoints that require a full (post-2FA) session: enrolling/replacing the
+    // authenticator and logout. Gating enrol/confirm here is what prevents a password-only
+    // (awaiting-2fa) caller from overwriting the victim's TOTP secret.
+    let guarded_auth = Router::new()
         .route("/logout", post(login::logout))
         .route("/2fa/enrol", post(login::enrol_2fa))
-        .route("/2fa/confirm", post(login::confirm_2fa));
+        .route("/2fa/confirm", post(login::confirm_2fa))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_auth,
+        ));
+    let auth_routes = public_auth.merge(guarded_auth);
 
     // The React SPA lives at /app/web. Serve it as fallback so deep links work
     // (/transactions, /budgets etc all serve index.html → SPA routes resolve client-side).
