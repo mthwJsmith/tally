@@ -1,0 +1,20 @@
+# Build context excludes. docker-compose uses `context: .` (repo root), so this file (not
+# apps/api/.dockerignore) is what applies. Keep the context tiny: the Dockerfile only needs
+# source, Cargo manifests, migrations, templates, static, and apps/web sources.
+.git/
+**/target/
+**/node_modules/
+**/dist/
+**/data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.tsbuildinfo
+**/.env
+**/.env.*
+!**/.env.example
+docs/
+**/.DS_Store
+.idea/
+.vscode/
