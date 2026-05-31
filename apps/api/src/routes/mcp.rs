@@ -473,10 +473,22 @@ async fn call_tool(state: &AppState, name: &str, args: &Value) -> Result<Value, 
                 .create_watchlist_item(name, keywords, target, "GBP")
                 .await
                 .map_err(err)?;
+            let mut added = 0;
             if let Some(urls) = args.get("rss_urls").and_then(|v| v.as_array()) {
                 for u in urls.iter().filter_map(|v| v.as_str()) {
-                    let _ = state.db.add_watchlist_source(id, "rss", u.trim()).await;
+                    if state.db.add_watchlist_source(id, "rss", u.trim()).await.is_ok() {
+                        added += 1;
+                    }
                 }
+            }
+            // Smart default: no feeds given -> auto-watch HotUKDeals for the name.
+            if added == 0 {
+                let q = match keywords {
+                    Some(k) if !k.trim().is_empty() => format!("{name} {}", k.trim()),
+                    _ => name.to_string(),
+                };
+                let feed = crate::routes::api::watchlist::hukd_feed(&q);
+                let _ = state.db.add_watchlist_source(id, "rss", &feed).await;
             }
             Ok(json!({ "ok": true, "id": id }))
         }

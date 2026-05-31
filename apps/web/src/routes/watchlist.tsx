@@ -52,8 +52,8 @@ function WatchlistPage() {
           <em>Watchlist</em>
         </h1>
         <p className="text-mid text-sm">
-          Track deals from RSS feeds (HotUKDeals, CamelCamelCamel) and changedetection.io. Alerts
-          fire when a found price is at or under your target.
+          Type what you want plus a target price, and tally auto-watches HotUKDeals for it and
+          alerts you when a deal drops to your target. Adding extra feeds is optional.
         </p>
       </header>
 
@@ -81,7 +81,7 @@ function WatchlistPage() {
         <textarea
           className="input"
           rows={2}
-          placeholder="RSS feed URLs (one per line), e.g. https://www.hotukdeals.com/search.rss?q=Festool+TS+55"
+          placeholder="Optional: extra RSS feed URLs, one per line (HotUKDeals is auto-added for the name)"
           value={feeds}
           onChange={(e) => setFeeds(e.target.value)}
         />
