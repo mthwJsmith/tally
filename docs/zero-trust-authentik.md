@@ -55,8 +55,8 @@ Restart tally. On boot it logs `MCP OIDC resource server: issuer=…`. When an M
 `/.well-known/oauth-protected-resource`, whose `authorization_servers` now lists your Authentik
 issuer — so the client discovers Authentik and runs the OAuth flow against it.
 
-> Legacy API tokens (Settings → API tokens) still work on `/mcp` for scripts / Home Assistant,
-> so you don't have to migrate those.
+> `/mcp` accepts **only** OIDC JWTs — there is no API-token fallback. (API tokens still work for
+> the `/api/*` REST endpoints used by scripts / Home Assistant; they just aren't accepted on `/mcp`.)
 
 ## 3. Put the web UI behind forward-auth (zero-trust)
 
