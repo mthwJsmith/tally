@@ -4,6 +4,18 @@ Self-hosted personal finance for UK Open Banking. Rust (axum) backend, React fro
 Docker container, SQLite storage with secrets encrypted at rest. It includes an MCP server so AI
 assistants can read your finances in near real-time, and built-in 2FA.
 
+## What it does
+
+- Syncs UK bank accounts through TrueLayer. Multi-bank with a single OAuth callback URL.
+- Stores every transaction locally in SQLite, not just references.
+- Rules engine (regex to category), budgets, bills, and search/aggregate APIs.
+- Tracks investment holdings and net worth.
+- Custom recurring reminders and checklists (e.g. Help to Save, card due dates) with Telegram
+  alerts, shown alongside your auto-detected direct debits.
+- Exposes an MCP server so Claude, ChatGPT, and similar clients can query your data and read or
+  tick reminders.
+- Has its own auth: first-run setup, Argon2id passwords, and TOTP 2FA with recovery codes.
+
 ## Screenshots
 
 All data below is fake demo data.
@@ -37,18 +49,6 @@ You do not have to rely on that layer alone. tally also protects itself: Argon2i
 hashing, TOTP 2FA with single-use codes, per-IP login rate limiting with lockout, ChaCha20-Poly1305
 encryption of tokens at rest, and standard security headers. Run it behind a TLS reverse proxy and
 set `TALLY_SECURE_COOKIES=true`.
-
-## What it does
-
-- Syncs UK bank accounts through TrueLayer. Multi-bank with a single OAuth callback URL.
-- Stores every transaction locally in SQLite, not just references.
-- Rules engine (regex to category), budgets, bills, and search/aggregate APIs.
-- Tracks investment holdings and net worth.
-- Custom recurring reminders and checklists (e.g. Help to Save, card due dates) with Telegram
-  alerts, shown alongside your auto-detected direct debits.
-- Exposes an MCP server so Claude, ChatGPT, and similar clients can query your data and read or
-  tick reminders.
-- Has its own auth: first-run setup, Argon2id passwords, and TOTP 2FA with recovery codes.
 
 ## Requirements
 
