@@ -7,7 +7,7 @@
 # with cargo-chef warm cache.
 
 # ---- frontend build -------------------------------------------------------
-FROM node:22-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS web-build
+FROM node:26-slim@sha256:aa27a5fbf5acb298116a38133794f080406c6f8dfe52e2e2836bb55dc7cae8f0 AS web-build
 WORKDIR /web
 COPY apps/web/package.json apps/web/package-lock.json* ./
 RUN npm install --no-audit --no-fund --silent
