@@ -92,6 +92,43 @@ impl Db {
         Ok((token, chat))
     }
 
+    /// Store the Claude routine endpoint URL (plain) + bearer token (encrypted at rest).
+    /// An empty token keeps the existing one; the UI never round-trips the secret.
+    pub async fn set_routine_config(&self, endpoint: &str, token: &str) -> Result<()> {
+        let token = token.trim();
+        if !token.is_empty() {
+            let (nonce, ct) = self.crypto.encrypt(token)?;
+            let v = format!("enc:{}:{}", B64.encode(nonce), B64.encode(ct));
+            self.set_setting("claude_routine_token", &v).await?;
+        }
+        self.set_setting("claude_routine_endpoint", endpoint.trim())
+            .await?;
+        Ok(())
+    }
+
+    /// Returns (endpoint, bearer_token), decrypting the token. Either may be None.
+    pub async fn get_routine_config(&self) -> Result<(Option<String>, Option<String>)> {
+        let token = match self.get_setting("claude_routine_token").await? {
+            Some(v) if v.starts_with("enc:") => {
+                let parts: Vec<&str> = v.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    match (B64.decode(parts[1]), B64.decode(parts[2])) {
+                        (Ok(nonce), Ok(ct)) => self.crypto.decrypt(&nonce, &ct).ok(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let endpoint = self
+            .get_setting("claude_routine_endpoint")
+            .await?
+            .filter(|s| !s.is_empty());
+        Ok((endpoint, token))
+    }
+
     // ---------- consents ----------
 
     pub async fn list_consents(&self) -> Result<Vec<Consent>> {

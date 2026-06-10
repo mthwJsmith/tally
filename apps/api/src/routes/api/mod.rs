@@ -8,6 +8,7 @@ pub mod categories;
 pub mod csv_import;
 pub mod holdings;
 pub mod reminders;
+pub mod routine;
 pub mod rules;
 pub mod tags;
 pub mod telegram;
