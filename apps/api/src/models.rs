@@ -102,41 +102,6 @@ pub struct Reminder {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
-pub struct WatchlistItem {
-    pub id: i64,
-    pub name: String,
-    pub keywords: Option<String>,
-    pub target_price_cents: Option<i64>,
-    pub currency: String,
-    pub archived: i64,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize)]
-pub struct WatchlistSource {
-    pub id: i64,
-    pub item_id: i64,
-    pub kind: String,
-    #[sqlx(rename = "ref")]
-    #[serde(rename = "ref")]
-    pub ref_: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize)]
-pub struct DealObservation {
-    pub id: i64,
-    pub item_id: i64,
-    pub title: String,
-    pub url: Option<String>,
-    pub price_cents: Option<i64>,
-    pub source_kind: String,
-    pub guid: String,
-    pub found_at: i64,
-    pub notified: i64,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct RecurringEntry {
     pub id: i64,
     pub account_id: i64,

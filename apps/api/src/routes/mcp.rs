@@ -114,7 +114,7 @@ struct AuthCtx {
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
-        "add_investment_activity" | "add_reminder" | "tick_reminder" | "add_watchlist_item"
+        "add_investment_activity" | "add_reminder" | "tick_reminder"
     )
 }
 
@@ -229,33 +229,6 @@ fn tool_defs() -> Value {
                 "type": "object",
                 "properties": { "reminder_id": { "type": "integer" } },
                 "required": ["reminder_id"]
-            }
-        },
-        {
-            "name": "list_watchlist",
-            "description": "List deal-watchlist items the user is tracking, with target prices.",
-            "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "list_deals",
-            "description": "List recently found deals/prices across the watchlist, newest first.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "limit": { "type": "integer", "description": "max rows (default 50)" } }
-            }
-        },
-        {
-            "name": "add_watchlist_item",
-            "description": "Add an item to the deal watchlist with an optional target price (pence) and RSS feed URLs to poll (e.g. a HotUKDeals search.rss URL).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "keywords": { "type": "string" },
-                    "target_price_cents": { "type": "integer", "description": "alert when a found price is at/under this (pence)" },
-                    "rss_urls": { "type": "array", "items": { "type": "string" }, "description": "RSS feed URLs to poll" }
-                },
-                "required": ["name"]
             }
         }
     ])
@@ -449,48 +422,6 @@ async fn call_tool(state: &AppState, name: &str, args: &Value) -> Result<Value, 
                 .ok_or_else(|| "reminder_id required".to_string())?;
             state.db.tick_reminder(id).await.map_err(err)?;
             Ok(json!({ "ok": true }))
-        }
-        "list_watchlist" => {
-            let items = state.db.list_watchlist().await.map_err(err)?;
-            Ok(json!({ "items": items }))
-        }
-        "list_deals" => {
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
-            let deals = state.db.recent_deals(limit).await.map_err(err)?;
-            Ok(json!({ "deals": deals }))
-        }
-        "add_watchlist_item" => {
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "name required".to_string())?;
-            let keywords = args.get("keywords").and_then(|v| v.as_str());
-            let target = args.get("target_price_cents").and_then(|v| v.as_i64());
-            let id = state
-                .db
-                .create_watchlist_item(name, keywords, target, "GBP")
-                .await
-                .map_err(err)?;
-            let mut added = 0;
-            if let Some(urls) = args.get("rss_urls").and_then(|v| v.as_array()) {
-                for u in urls.iter().filter_map(|v| v.as_str()) {
-                    if state.db.add_watchlist_source(id, "rss", u.trim()).await.is_ok() {
-                        added += 1;
-                    }
-                }
-            }
-            // Smart default: no feeds given -> auto-watch HotUKDeals for the name.
-            if added == 0 {
-                let q = match keywords {
-                    Some(k) if !k.trim().is_empty() => format!("{name} {}", k.trim()),
-                    _ => name.to_string(),
-                };
-                let feed = crate::routes::api::watchlist::hukd_feed(&q);
-                let _ = state.db.add_watchlist_source(id, "rss", &feed).await;
-            }
-            Ok(json!({ "ok": true, "id": id }))
         }
         _ => Err(format!("unknown tool: {name}")),
     }

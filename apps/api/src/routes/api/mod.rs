@@ -12,4 +12,3 @@ pub mod rules;
 pub mod tags;
 pub mod telegram;
 pub mod transactions;
-pub mod watchlist;
