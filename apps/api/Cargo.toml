@@ -36,7 +36,7 @@ base64 = "0.22"
 argon2 = "0.5"  # password-hash for any local-admin gating
 
 # JWT decode (to extract credentials_id from TrueLayer access tokens)
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Scheduling
 tokio-cron-scheduler = "0.13"
