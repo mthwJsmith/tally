@@ -6,11 +6,18 @@ assistants can read your finances, and built-in 2FA.
 
 ## Before you expose it publicly
 
-tally aggregates your bank data, so treat it like a sensitive internal app. If it will be
-reachable from the internet, put a zero-trust layer in front of it. The easiest option is
-Cloudflare Zero Trust (Cloudflare Access) on your domain; an identity provider with forward-auth
-(Authentik, Authelia, Keycloak) works the same way. Gate the web UI, and leave only the paths
-that machines need reachable: `/mcp`, `/.well-known/*`, and `/auth/callback` (the bank redirect).
+tally aggregates your bank data, so treat it like a sensitive internal app. tally has its own
+login and TOTP 2FA, but if it will be reachable from the internet we strongly recommend a
+zero-trust access layer in front of it as well. The easiest option is Cloudflare Zero Trust
+(Cloudflare Access) on your domain; an identity provider with forward-auth (Authentik, Authelia,
+Keycloak) works the same way.
+
+Gate the web UI, and leave only the paths that machines need reachable: `/mcp`,
+`/.well-known/*`, and `/auth/callback` (the bank redirect). tally protects `/mcp` itself by
+validating OIDC tokens, so bypassing the access layer on those paths does not leave them open.
+If Claude or another MCP client connects but never shows any tally tools, this is the first
+thing to check: the access layer is almost certainly intercepting `/mcp` or `/.well-known/*`
+with a login redirect that the client cannot follow.
 
 You do not have to rely on that layer alone. tally also protects itself: Argon2id password
 hashing, TOTP 2FA with single-use codes, per-IP login rate limiting with lockout, ChaCha20-Poly1305
