@@ -39,7 +39,7 @@ argon2 = "0.5"  # password-hash for any local-admin gating
 jsonwebtoken = "9"
 
 # Scheduling
-tokio-cron-scheduler = "0.13"
+tokio-cron-scheduler = "0.15"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
