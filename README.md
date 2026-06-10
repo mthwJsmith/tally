@@ -4,6 +4,20 @@ Self-hosted personal finance for UK Open Banking. Rust (axum) backend, React fro
 Docker container, SQLite storage with secrets encrypted at rest. It includes an MCP server so AI
 assistants can read your finances, and built-in 2FA.
 
+## Screenshots
+
+All data below is fake demo data.
+
+![Dashboard](.github/screenshots/dashboard.png)
+
+| Transactions | Investments |
+|---|---|
+| ![Transactions](.github/screenshots/transactions.png) | ![Investments](.github/screenshots/investments.png) |
+
+| Reminders and direct debits | |
+|---|---|
+| ![Reminders](.github/screenshots/reminders.png) | |
+
 ## Before you expose it publicly
 
 tally aggregates your bank data, so treat it like a sensitive internal app. tally has its own

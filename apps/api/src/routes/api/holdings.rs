@@ -470,22 +470,53 @@ pub async fn portfolio_history(
         q.range.clone()
     };
 
-    // ts → total value
-    let mut totals: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    // Symbols on different exchanges report different timestamps (LSE 16:30 UTC close vs
+    // NYSE 21:00), so summing by raw timestamp produces partial totals that seesaw between
+    // "just the US holdings" and "everything". Bucket each series (daily unless the interval
+    // is intraday) and carry the last close forward across each symbol's non-trading days.
+    let bucket: i64 = if q.interval.contains('m') && !q.interval.contains("mo") || q.interval.contains('h') {
+        3_600
+    } else {
+        86_400
+    };
+    let mut per_symbol: Vec<(f64, std::collections::BTreeMap<i64, f64>)> = Vec::new();
     for (symbol, qty) in &qty_by_symbol {
         match yc.history(symbol, &range, &q.interval).await {
             Ok(points) => {
+                let mut by_bucket = std::collections::BTreeMap::new();
                 for p in points {
-                    *totals.entry(p.timestamp).or_insert(0.0) += p.close * qty;
+                    by_bucket.insert(p.timestamp - p.timestamp.rem_euclid(bucket), p.close);
+                }
+                if !by_bucket.is_empty() {
+                    per_symbol.push((*qty, by_bucket));
                 }
             }
             Err(e) => tracing::warn!("history {symbol}: {e:#}"),
         }
     }
-
-    let series: Vec<Value> = totals
+    let buckets: std::collections::BTreeSet<i64> = per_symbol
+        .iter()
+        .flat_map(|(_, m)| m.keys().copied())
+        .collect();
+    let series: Vec<Value> = buckets
         .into_iter()
-        .map(|(ts, v)| json!({ "timestamp": ts, "value": v }))
+        .map(|ts| {
+            let total: f64 = per_symbol
+                .iter()
+                .map(|(qty, m)| {
+                    // last close at or before this bucket; before a series starts, use its
+                    // first close so the total doesn't step when the series begins
+                    let close = m
+                        .range(..=ts)
+                        .next_back()
+                        .map(|(_, c)| *c)
+                        .or_else(|| m.values().next().copied())
+                        .unwrap_or(0.0);
+                    close * qty
+                })
+                .sum();
+            json!({ "timestamp": ts, "value": total })
+        })
         .collect();
     Ok(Json(json!({ "points": series, "cost_basis": cost_basis })))
 }
