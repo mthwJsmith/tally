@@ -12,7 +12,7 @@ axum = { version = "0.8", features = ["macros", "tokio"] }
 tokio = { version = "1.40", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "fs", "set-header", "limit"] }
-tower-sessions = "0.14"
+tower-sessions = "0.15"
 tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
 axum-login = "0.18"
 
