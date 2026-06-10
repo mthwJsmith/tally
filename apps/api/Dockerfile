@@ -16,7 +16,7 @@ RUN npm run build
 # → /web/dist
 
 # ---- planner: extract Rust dep recipe -------------------------------------
-FROM rust:1.89-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6 AS planner
+FROM rust:1.96-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS planner
 WORKDIR /app
 RUN cargo install cargo-chef --locked
 COPY apps/api/Cargo.toml apps/api/Cargo.lock ./
@@ -27,7 +27,7 @@ COPY apps/api/static ./static
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ---- builder: deps then app ----------------------------------------------
-FROM rust:1.89-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6 AS builder
+FROM rust:1.96-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config build-essential ca-certificates \
