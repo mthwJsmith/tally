@@ -31,7 +31,7 @@ askama = "0.12"
 
 # Crypto for token-at-rest encryption
 chacha20poly1305 = "0.10"
-rand = "0.8"
+rand = "0.9"
 base64 = "0.22"
 argon2 = "0.5"  # password-hash for any local-admin gating
 
