@@ -2,7 +2,7 @@
 
 Self-hosted personal finance for UK Open Banking. Rust (axum) backend, React frontend, one
 Docker container, SQLite storage with secrets encrypted at rest. It includes an MCP server so AI
-assistants can read your finances, and built-in 2FA.
+assistants can read your finances in near real-time, and built-in 2FA.
 
 ## Screenshots
 
