@@ -51,8 +51,15 @@ impl AuthnBackend for Backend {
             .bind(creds.username.trim())
             .fetch_optional(&self.db.pool)
             .await?;
-        // Constant-ish: only return the user when the password verifies.
-        Ok(user.filter(|u| auth::verify_password(&creds.password, &u.password_hash)))
+        // Burn the same Argon2 work whether or not the username exists so response
+        // timing doesn't reveal which usernames are registered.
+        match user {
+            Some(u) => Ok(Some(u).filter(|u2| auth::verify_password(&creds.password, &u2.password_hash))),
+            None => {
+                auth::verify_password_dummy(&creds.password);
+                Ok(None)
+            }
+        }
     }
 
     async fn get_user(&self, user_id: &UserId<Self>) -> Result<Option<User>, Self::Error> {

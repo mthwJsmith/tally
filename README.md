@@ -25,10 +25,8 @@ set `TALLY_SECURE_COOKIES=true`.
 - Tracks investment holdings and net worth.
 - Custom recurring reminders and checklists (e.g. Help to Save, card due dates) with Telegram
   alerts, shown alongside your auto-detected direct debits.
-- A deal watchlist that polls free RSS feeds (HotUKDeals, CamelCamelCamel) and optionally a
-  self-hosted changedetection.io instance, and alerts when a price drops to your target.
 - Exposes an MCP server so Claude, ChatGPT, and similar clients can query your data and read or
-  tick reminders and the watchlist.
+  tick reminders.
 - Has its own auth: first-run setup, Argon2id passwords, and TOTP 2FA with recovery codes.
 
 ## Requirements
@@ -64,6 +62,7 @@ Full list is in `apps/api/.env.example`. The ones you usually need:
 | `TALLY_REDIRECT_URI_BASE` | Public base URL TrueLayer redirects back to |
 | `TALLY_OIDC_ISSUER` / `TALLY_OIDC_AUDIENCE` | External OIDC provider for the MCP connector |
 | `TALLY_SECURE_COOKIES` | Set to `true` when served over HTTPS |
+| `TALLY_TRUST_PROXY` | Set to `true` only behind a trusted reverse proxy (rate-limit keys then use `X-Forwarded-For`) |
 
 ## MCP connector
 
@@ -71,8 +70,7 @@ Full list is in `apps/api/.env.example`. The ones you usually need:
 provider's JWKS (signature, issuer, audience, expiry). To set it up, create an OAuth2/OIDC
 application in your provider, set `TALLY_OIDC_ISSUER` and `TALLY_OIDC_AUDIENCE` to match, then add
 the connector in your AI client. Read tools accept any valid token; write tools (recording an
-investment, adding or ticking a reminder, adding a watchlist item) require a token with the
-`write` scope.
+investment, adding or ticking a reminder) require a token with the `write` scope.
 
 A ready-to-run Authentik stack is included:
 
@@ -80,26 +78,12 @@ A ready-to-run Authentik stack is included:
 docker compose -f docker-compose.yml -f docker-compose.idp.yml up -d
 ```
 
-## Reminders and deal watchlist
+## Reminders
 
 Reminders are recurring checklist items (hourly, daily, weekly, or monthly on a fixed day of the
 month). tally pings you on Telegram when one is due and not ticked, then rolls it to the next
 period. The screen also shows your auto-detected direct debits, so it is one place for everything
 you owe or need to do.
-
-The watchlist polls free RSS feeds for deals on things you want. Add a HotUKDeals search feed
-(`https://www.hotukdeals.com/search.rss?q=...`) or a CamelCamelCamel product price-drop feed, set
-a target price, and tally alerts you when a found price is at or under it.
-
-For tracking specific product URLs, run changedetection.io alongside tally. It does the page fetch
-and price extraction, and tally pulls the result into the watchlist. RSS feeds are the reliable
-baseline; changedetection.io handles many product pages, but the most aggressive anti-bot sites
-can still block it even with a real browser.
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.deals.yml up -d
-# then set TALLY_CHANGEDETECTION_URL and TALLY_CHANGEDETECTION_API_KEY in .env
-```
 
 ## Build from source
 

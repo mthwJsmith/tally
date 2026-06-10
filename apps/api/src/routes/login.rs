@@ -10,8 +10,9 @@ use crate::auth;
 use crate::auth_backend::{AuthSession, Credentials};
 use crate::ratelimit;
 use crate::AppState;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
+use std::net::SocketAddr;
 use axum::Json;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -22,15 +23,31 @@ use tower_sessions::Session;
 /// tower-session key holding the user id of a first-factor-authenticated, awaiting-2FA login.
 const PENDING_2FA_KEY: &str = "pending_2fa_uid";
 
-/// Best-effort client IP for rate-limiting keys (first hop of X-Forwarded-For).
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "noip".to_string())
+/// Whether a trusted reverse proxy sits in front (TALLY_TRUST_PROXY=true). Only then is
+/// X-Forwarded-For honoured; otherwise a direct caller could mint a fresh rate-limit
+/// bucket per request by spoofing the header.
+static TRUST_PROXY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("TALLY_TRUST_PROXY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
+/// Client IP for rate-limiting keys: the TCP peer address, unless a trusted proxy is
+/// declared — then the last X-Forwarded-For entry (the hop the proxy itself appended;
+/// earlier entries are client-supplied and forgeable).
+fn client_ip(addr: &SocketAddr, headers: &HeaderMap) -> String {
+    if *TRUST_PROXY {
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next_back())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_string();
+        }
+    }
+    addr.ip().to_string()
 }
 
 /// Standard 429 response when a rate-limit key is locked out.
@@ -83,12 +100,13 @@ pub async fn setup(
 
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     session: Session,
     mut auth_session: AuthSession,
     Json(body): Json<auth::LoginInput>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let key = format!("login:{}", client_ip(&headers));
+    let key = format!("login:{}", client_ip(&addr, &headers));
     if let Err(wait) = ratelimit::check(&key) {
         return Err(too_many(wait));
     }
@@ -121,12 +139,13 @@ pub async fn login(
 
 pub async fn verify_2fa(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     session: Session,
     mut auth_session: AuthSession,
     Json(body): Json<auth::VerifyTotpInput>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let key = format!("2fa:{}", client_ip(&headers));
+    let key = format!("2fa:{}", client_ip(&addr, &headers));
     if let Err(wait) = ratelimit::check(&key) {
         return Err(too_many(wait));
     }
@@ -213,12 +232,13 @@ pub struct RecoveryBody {
 
 pub async fn recovery(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     session: Session,
     mut auth_session: AuthSession,
     Json(b): Json<RecoveryBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let key = format!("recovery:{}", client_ip(&headers));
+    let key = format!("recovery:{}", client_ip(&addr, &headers));
     if let Err(wait) = ratelimit::check(&key) {
         return Err(too_many(wait));
     }
@@ -280,9 +300,11 @@ pub async fn me(
     }
 }
 
+// Log the real error server-side; never echo internals to an (unauthenticated) caller.
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+    tracing::error!("auth route internal error: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
 }
 fn internal_str(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+    internal(e)
 }
