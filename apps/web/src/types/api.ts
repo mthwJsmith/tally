@@ -17,36 +17,6 @@ export interface Reminder {
   updated_at: number;
 }
 
-export interface WatchlistSource {
-  id: number;
-  item_id: number;
-  kind: string;
-  ref: string;
-  created_at: number;
-}
-
-export interface WatchlistItem {
-  id: number;
-  name: string;
-  keywords: string | null;
-  target_price_cents: number | null;
-  currency: string;
-  archived: number;
-  created_at: number;
-}
-
-export interface DealObservation {
-  id: number;
-  item_id: number;
-  title: string;
-  url: string | null;
-  price_cents: number | null;
-  source_kind: string;
-  guid: string;
-  found_at: number;
-  notified: number;
-}
-
 export interface Account {
   id: number;
   consent_id: number;
