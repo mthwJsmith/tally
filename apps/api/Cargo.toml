@@ -63,7 +63,7 @@ regex = "1"
 totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
 axum-extra = { version = "0.10", features = ["typed-header", "cookie"] }
 csv = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 time = "0.3"
 
 [profile.release]
