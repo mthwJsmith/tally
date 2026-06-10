@@ -88,12 +88,33 @@ Full list is in `apps/api/.env.example`. The ones you usually need:
 ## MCP connector
 
 `/mcp` accepts access tokens issued by your OIDC provider and validates them against the
-provider's JWKS (signature, issuer, audience, expiry). To set it up, create an OAuth2/OIDC
-application in your provider, set `TALLY_OIDC_ISSUER` and `TALLY_OIDC_AUDIENCE` to match, then add
-the connector in your AI client. Read tools accept any valid token; write tools (recording an
-investment, adding or ticking a reminder) require a token with the `write` scope.
+provider's JWKS (signature, issuer, audience, expiry). Read tools accept any valid token; write
+tools (recording an investment, adding or ticking a reminder) require a token with the `write`
+scope. There are two ways to provide the OIDC side.
 
-A ready-to-run Authentik stack is included:
+### Option A: Cloudflare Access Managed OAuth (nothing extra to run)
+
+If tally already sits behind Cloudflare, you do not need to host your own identity provider.
+In Cloudflare Zero Trust, create a self-hosted Access application covering your tally hostname's
+`/mcp` path, enable **Managed OAuth** in its advanced settings, add an Allow policy for yourself,
+and copy the application's AUD tag. Then set:
+
+```
+TALLY_OIDC_ISSUER=https://<your-team>.cloudflareaccess.com
+TALLY_OIDC_AUDIENCE=<the Access application AUD tag>
+TALLY_OIDC_JWKS_URL=https://<your-team>.cloudflareaccess.com/cdn-cgi/access/certs
+```
+
+Cloudflare runs the OAuth flow for claude.ai and forwards each request with a
+`Cf-Access-Jwt-Assertion` JWT, which tally validates like any other OIDC token. Cloudflare's
+tokens carry no `write` scope, so this path is read-only.
+
+### Option B: your own OIDC provider
+
+Create an OAuth2/OIDC application in your provider (Authentik, Keycloak, Auth0, and so on), set
+`TALLY_OIDC_ISSUER` and `TALLY_OIDC_AUDIENCE` to match, then add the connector in your AI client.
+A ready-to-run Authentik stack is included (note: it is too heavy for small hosts like a 2 GB Pi;
+run it on a bigger box or use Option A):
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.idp.yml up -d

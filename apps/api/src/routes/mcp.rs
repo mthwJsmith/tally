@@ -1,11 +1,11 @@
 //! Minimal MCP server over the Streamable-HTTP transport.
 //!
 //! Exposes a small set of tools so AI clients (Claude / Claude Code / claude.ai custom
-//! connector) can query tally. Most tools are read-only; `add_investment_activity` mutates and
-//! requires the `write` scope. Single endpoint `POST /mcp` speaking JSON-RPC 2.0; `GET /mcp`
-//! returns 405 (no server-initiated SSE stream — not required by the spec). Auth is either an
-//! OIDC JWT from the configured IdP (scope-gated) or a tally API token (`Authorization: Bearer
-//! <token>`, minted in Settings → full access).
+//! connector) can query tally. Most tools are read-only; mutating tools require the `write`
+//! scope. Single endpoint `POST /mcp` speaking JSON-RPC 2.0; `GET /mcp` returns 405 (no
+//! server-initiated SSE stream — not required by the spec). The only accepted credential is
+//! an OIDC JWT from the configured IdP, taken from `Authorization: Bearer` or, when Cloudflare
+//! Access Managed OAuth fronts the endpoint, from `Cf-Access-Jwt-Assertion`.
 
 use crate::{oidc, AppState};
 use axum::extract::State;
@@ -119,10 +119,22 @@ fn is_write_tool(name: &str) -> bool {
 }
 
 async fn authed(state: &AppState, headers: &HeaderMap) -> Option<AuthCtx> {
-    let h = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
-    let raw = h.strip_prefix("Bearer ")?.trim();
-    // OIDC JWT from the external IdP (Authentik/Keycloak) is the ONLY accepted credential on
-    // /mcp — no legacy API-token fallback. Reads need any valid token; writes need `write` scope.
+    // Token sources: `Authorization: Bearer` (direct OIDC clients), else
+    // `Cf-Access-Jwt-Assertion` (Cloudflare Access Managed OAuth in front of /mcp:
+    // Cloudflare runs the OAuth flow for the client and forwards its own JWT, validated
+    // here against the team's JWKS like any other issuer).
+    let raw = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get("cf-access-jwt-assertion")
+                .and_then(|v| v.to_str().ok())
+        })?
+        .trim();
+    // An OIDC JWT from the configured IdP is the ONLY accepted credential on /mcp — no
+    // legacy API-token fallback. Reads need any valid token; writes need `write` scope.
     let cfg = state.oidc.as_ref()?;
     let claims = oidc::validate(cfg, raw).await?;
     Some(AuthCtx {
