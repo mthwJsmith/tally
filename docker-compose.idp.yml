@@ -12,10 +12,14 @@
 #   PG_PASS:              `openssl rand -base64 36`
 # Then finish setup in the Authentik UI: create an OAuth2/OIDC provider whose issuer/audience
 # match TALLY_OIDC_ISSUER/TALLY_OIDC_AUDIENCE, and (optionally) a proxy provider for forward-auth.
+#
+# postgres/redis are digest-pinned (Dependabot bumps them). The Authentik image is tag-based so
+# AUTHENTIK_IMAGE/AUTHENTIK_TAG stay overridable; pin a digest in your .env if you want the same
+# guarantee there.
 
 services:
   authentik-postgresql:
-    image: docker.io/library/postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
@@ -30,7 +34,7 @@ services:
       POSTGRES_DB: ${PG_DB:-authentik}
 
   authentik-redis:
-    image: docker.io/library/redis:alpine
+    image: docker.io/library/redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     command: --save 60 1 --loglevel warning
     restart: unless-stopped
     healthcheck:

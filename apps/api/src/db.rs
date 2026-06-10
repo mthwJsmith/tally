@@ -1380,6 +1380,10 @@ impl Db {
         notify_before: i64,
         notify_enabled: bool,
     ) -> Result<i64> {
+        const FREQS: [&str; 4] = ["hours", "days", "weeks", "months"];
+        if !FREQS.contains(&freq) {
+            anyhow::bail!("invalid freq '{freq}' (expected hours|days|weeks|months)");
+        }
         let now = Utc::now().timestamp();
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO reminders (title, notes, freq, every_n, anchor_day, due_at,
@@ -1667,6 +1671,7 @@ impl Db {
         currency: &str,
         notes: Option<&str>,
     ) -> Result<i64> {
+        validate_activity(activity_type, quantity, price_per_unit, fee)?;
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO holding_activities (holding_id, activity_type, timestamp, quantity,
                 price_per_unit, fee, currency, notes, created_at)
@@ -1708,6 +1713,7 @@ impl Db {
         fee: f64,
         notes: Option<&str>,
     ) -> Result<Option<i64>> {
+        validate_activity(activity_type, quantity, price_per_unit, fee)?;
         let holding_id: Option<i64> =
             sqlx::query_scalar("SELECT holding_id FROM holding_activities WHERE id = ?")
                 .bind(id)
@@ -1864,6 +1870,41 @@ impl Db {
         .await?;
         Ok(())
     }
+}
+
+/// Guard activity writes (REST and MCP both land here): known type, finite non-negative
+/// amounts. SQLite would happily store NaN/garbage and silently skew cost-basis maths.
+fn validate_activity(
+    activity_type: &str,
+    quantity: f64,
+    price_per_unit: Option<f64>,
+    fee: f64,
+) -> Result<()> {
+    const TYPES: [&str; 8] = [
+        "BUY",
+        "SELL",
+        "DIVIDEND",
+        "SPLIT",
+        "FEE",
+        "INTEREST",
+        "TRANSFER_IN",
+        "TRANSFER_OUT",
+    ];
+    if !TYPES.contains(&activity_type) {
+        anyhow::bail!("invalid activity_type '{activity_type}' (expected one of {TYPES:?})");
+    }
+    for (name, v) in [
+        ("quantity", Some(quantity)),
+        ("price_per_unit", price_per_unit),
+        ("fee", Some(fee)),
+    ] {
+        if let Some(v) = v {
+            if !v.is_finite() || v < 0.0 {
+                anyhow::bail!("{name} must be a finite non-negative number");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Roll `from_ts` forward by `freq` periods until it is strictly after `now`.

@@ -1,4 +1,4 @@
-//! Built-in auth: Argon2id passwords + TOTP RFC 6238 2FA + session cookies + API tokens.
+//! Built-in auth: Argon2id passwords + TOTP RFC 6238 2FA + session cookies.
 //!
 //! Flow:
 //!   1. First run: `users` empty → UI shows /setup wizard to register first admin (no 2FA yet)
@@ -55,6 +55,23 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// A real Argon2id hash that non-existent users are "verified" against so login latency
+/// doesn't reveal whether a username is registered.
+static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    hash_password("tally-timing-equalizer").expect("argon2 dummy hash")
+});
+
+/// Burn the same Argon2 work as a real verification; always fails.
+pub fn verify_password_dummy(password: &str) {
+    let _ = verify_password(password, &DUMMY_HASH);
+}
+
+/// Constant-time equality for short secrets (recovery / TOTP codes). Length still
+/// short-circuits, which is fine — code lengths are public.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub fn new_recovery_codes(n: usize) -> Vec<String> {
@@ -177,7 +194,10 @@ pub fn decrypt_recovery_codes(db: &Db, user: &User) -> Result<Vec<String>> {
 pub async fn consume_recovery_code(db: &Db, user: &User, candidate: &str) -> Result<bool> {
     let mut codes = decrypt_recovery_codes(db, user)?;
     let candidate = candidate.trim().to_lowercase();
-    if let Some(pos) = codes.iter().position(|c| c.eq_ignore_ascii_case(&candidate)) {
+    if let Some(pos) = codes
+        .iter()
+        .position(|c| ct_eq(c.to_lowercase().as_bytes(), candidate.as_bytes()))
+    {
         codes.remove(pos);
         // Re-encrypt + save remaining codes.
         let json = serde_json::to_string(&codes)?;
@@ -218,7 +238,7 @@ pub async fn verify_totp_fresh(db: &Db, user: &User, code: &str) -> Result<bool>
     let step = now / 30;
     // Accept the current step and ±1 skew (matching make_totp's skew of 1).
     for cand in [step.saturating_sub(1), step, step + 1] {
-        if totp.generate(cand * 30) == code {
+        if ct_eq(totp.generate(cand * 30).as_bytes(), code.as_bytes()) {
             if (cand as i64) <= user.last_totp_step {
                 return Ok(false); // already-used or older step → replay
             }

@@ -145,7 +145,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     // Embedded admin / OAuth-linking pages. These expose linked-bank info and allow
     // destructive consent mutations, so they MUST sit behind the same auth gate as /api
-    // (a valid non-awaiting-2fa session or API token) — never publicly reachable.
+    // (a valid non-awaiting-2fa session) — never publicly reachable.
     let admin_routes = Router::new()
         .route("/consents", get(consents::list).post(consents::create))
         .route("/consents/{id}/sync", post(consents::sync_one))

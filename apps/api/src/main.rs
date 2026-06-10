@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     let oidc = oidc::OidcConfig::from_env();
     match &oidc {
         Some(c) => tracing::info!("MCP OIDC resource server: issuer={}", c.issuer),
-        None => tracing::info!("MCP OIDC disabled (set TALLY_OIDC_ISSUER/AUDIENCE to enable); /mcp uses API tokens only"),
+        None => tracing::info!("MCP OIDC disabled (set TALLY_OIDC_ISSUER/AUDIENCE to enable); /mcp rejects all requests"),
     }
     let state = Arc::new(AppState {
         db,
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
                 "default-src 'self'; \
                  img-src 'self' data:; \
                  style-src 'self' 'unsafe-inline'; \
-                 script-src 'self' https://unpkg.com; \
+                 script-src 'self'; \
                  connect-src 'self'; \
                  font-src 'self' data:; \
                  base-uri 'self'; \
@@ -152,6 +152,11 @@ async fn main() -> Result<()> {
     tracing::info!("OAuth redirect base: {tl_redirect_base}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    // with_connect_info: handlers need the TCP peer address for rate-limit keys.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
