@@ -43,9 +43,133 @@ function SettingsPage() {
       <TwoFactorSection enrolled={!!me.data?.totp_enrolled} />
       <TelegramSection />
       <AiSettingsSection />
+      <ClaudeRoutineSection />
       <RulesSection />
       <McpConnectSection />
     </div>
+  );
+}
+
+const ROUTINE_PROMPT = `You have access to my Tally finance data through the connected "Tally" MCP connector.
+
+When this routine runs:
+1. Use the Tally connector's read tools to gather my accounts, balances, budgets/goals,
+   bills and any saved promo/intro rate end-dates. Call the tools to get real figures;
+   don't assume or invent numbers.
+2. Report spending vs. each budget/goal: on track, ahead, or behind, with the actual number.
+3. Flag anything time-sensitive ending within the next 30 days (e.g. a promo interest rate)
+   and say what action it implies.
+4. Give 2-3 concrete recommendations based on what you found.
+
+Keep it tight: a short, scannable summary, not an essay. If the Tally connector returns
+nothing or isn't reachable, say so plainly instead of guessing.`;
+
+function ClaudeRoutineSection() {
+  const qc = useQueryClient();
+  const cfg = useQuery({
+    queryKey: ["routine"],
+    queryFn: () => api.get<{ configured: boolean; endpoint: string | null }>("/api/routine"),
+  });
+  const [endpoint, setEndpoint] = useState("");
+  const [token, setToken] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.put("/api/routine", { endpoint: endpoint || cfg.data?.endpoint || "", token }),
+    onSuccess: () => {
+      setToken("");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+      qc.invalidateQueries({ queryKey: ["routine"] });
+    },
+  });
+  const fire = useMutation({
+    mutationFn: () => api.post<{ ok: boolean; result: unknown }>("/api/routine/fire"),
+  });
+
+  return (
+    <section className="card p-6 space-y-4 fade-in-3">
+      <h2 className="text-lg font-semibold flex items-center gap-2">
+        <Sparkles className="size-5 text-orange" /> Claude weekly check (routine)
+      </h2>
+      <p className="text-sm text-mid">
+        Have your claude.ai subscription read this Tally instance on a schedule and report
+        spending vs. goals. You build the routine once on claude.ai; paste its API endpoint
+        and token below so Tally can fire it on demand too.
+      </p>
+
+      <div className="text-sm bg-cream/50 border border-thin rounded p-3 space-y-1">
+        <p className="font-semibold">Set it up on claude.ai</p>
+        <ol className="list-decimal ml-5 text-mid space-y-0.5">
+          <li>First add the <b>Tally connector</b> (see “Connect AI assistants” below).</li>
+          <li>Go to <b>claude.ai → Code → Routines → New routine</b>.</li>
+          <li>Name it and paste the prompt below as the instructions.</li>
+          <li>Set the trigger to <b>API</b> (add a weekly <b>Schedule</b> too if you want it hands-off).</li>
+          <li>Make sure the <b>Tally</b> connector is attached, then save.</li>
+          <li>Copy the routine’s endpoint URL + bearer token and paste them here.</li>
+        </ol>
+      </div>
+
+      <CopyBox label="Routine name" value="Tally Weekly Finance Check" />
+      <CopyBox label="Routine instructions (prompt)" value={ROUTINE_PROMPT} />
+
+      <div className="border-t border-thin pt-4 space-y-2">
+        <p className="text-sm">
+          Status:{" "}
+          {cfg.data?.configured ? (
+            <span className="pill-green">Configured</span>
+          ) : (
+            <span className="pill-grey">Not configured</span>
+          )}
+        </p>
+        <div>
+          <label className="text-xs font-semibold text-mid uppercase tracking-wider">
+            Routine endpoint URL
+          </label>
+          <input
+            className="input mt-1 mono"
+            placeholder={cfg.data?.endpoint ?? "https://api.anthropic.com/.../routines/<id>/fire"}
+            value={endpoint}
+            onChange={(e) => setEndpoint(e.target.value)}
+          />
+        </div>
+        <div>
+          <label className="text-xs font-semibold text-mid uppercase tracking-wider flex items-center gap-1">
+            <KeyRound className="size-3" /> Bearer token
+          </label>
+          <input
+            className="input mt-1"
+            type="password"
+            placeholder={cfg.data?.configured ? "(set, paste new to replace)" : "sk-ant-oat01-..."}
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+          />
+          <p className="text-xs text-mid mt-1">
+            Stored encrypted at rest and never shown again. Shown only once on claude.ai, so
+            if it leaks, regenerate it there.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button className="btn-primary" onClick={() => save.mutate()} disabled={save.isPending}>
+            <KeyRound className="size-4" /> {saved ? "Saved ✓" : "Save"}
+          </button>
+          <button
+            className="btn-outlined"
+            onClick={() => fire.mutate()}
+            disabled={fire.isPending || !cfg.data?.configured}
+          >
+            <Send className="size-4" /> {fire.isPending ? "Firing…" : "Fire now"}
+          </button>
+        </div>
+        {fire.isSuccess && (
+          <p className="text-xs text-green">Routine fired. Check claude.ai for the run.</p>
+        )}
+        {fire.isError && (
+          <p className="text-xs text-danger">{(fire.error as Error)?.message ?? "Failed to fire."}</p>
+        )}
+      </div>
+    </section>
   );
 }
 

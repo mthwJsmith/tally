@@ -72,6 +72,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(api::telegram::get).put(api::telegram::put),
         )
         .route("/telegram/test", post(api::telegram::test))
+        .route(
+            "/routine",
+            get(api::routine::get).put(api::routine::put),
+        )
+        .route("/routine/fire", post(api::routine::fire))
         .route("/sync/status", get(consents::api_recent_transactions))
         .route("/sync", post(consents::sync_all))
         .merge(csv_routes)
