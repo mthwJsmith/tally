@@ -20,7 +20,10 @@ axum-login = "0.18"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
 
 # Database (pure-Rust SQLite, no CGO needed for ARM cross-compile)
+# Migration in progress: sqlx (legacy) and libsql (Turso, target) coexist during the
+# transition so the crate keeps compiling. sqlx will be trimmed once the swap is complete.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
+libsql = "0.9"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
