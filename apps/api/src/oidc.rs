@@ -6,7 +6,7 @@
 //! issuer, audience, expiry). The JWKS is fetched lazily and cached, with a forced refresh on
 //! an unknown `kid` (key rotation).
 
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::{Mutex, OnceLock};
@@ -101,17 +101,21 @@ pub async fn validate(cfg: &OidcConfig, token: &str) -> Option<Claims> {
     let jwk = set.find(&kid)?;
     let key = DecodingKey::from_jwk(jwk).ok()?;
 
-    // Pin an asymmetric-only algorithm allowlist rather than trusting the token's own `alg`
-    // header — this prevents algorithm-confusion attacks (e.g. an `HS256` token forged with the
-    // public key). IdPs like Authentik/Keycloak sign with RS256 by default.
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.algorithms = vec![
-        Algorithm::RS256,
-        Algorithm::RS384,
-        Algorithm::RS512,
-        Algorithm::ES256,
-        Algorithm::ES384,
-    ];
+    // Pin the algorithm allowlist to the key's own family (asymmetric only) rather than
+    // trusting the token's `alg` header — this prevents algorithm-confusion attacks (e.g. an
+    // `HS256` token forged with the public key). The list must contain ONLY algorithms of the
+    // key's family: jsonwebtoken 9.3+ rejects the whole request with `InvalidAlgorithm` if any
+    // listed algorithm's family differs from the key's, so RSA and EC cannot be mixed here.
+    let algorithms = match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => {
+            vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512]
+        }
+        AlgorithmParameters::EllipticCurve(_) => vec![Algorithm::ES256, Algorithm::ES384],
+        // Symmetric / unsupported key types are never acceptable for token validation here.
+        _ => return None,
+    };
+    let mut validation = Validation::new(algorithms[0]);
+    validation.algorithms = algorithms;
     validation.set_issuer(&[cfg.issuer.as_str()]);
     validation.set_audience(&[cfg.audience.as_str()]);
     let data = decode::<Claims>(token, &key, &validation).ok()?;
