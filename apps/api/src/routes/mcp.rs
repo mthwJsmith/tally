@@ -119,27 +119,31 @@ fn is_write_tool(name: &str) -> bool {
 }
 
 async fn authed(state: &AppState, headers: &HeaderMap) -> Option<AuthCtx> {
-    // Token sources: `Authorization: Bearer` (direct OIDC clients), else
+    // Token sources: `Authorization: Bearer` (direct OIDC clients) and
     // `Cf-Access-Jwt-Assertion` (Cloudflare Access Managed OAuth in front of /mcp:
     // Cloudflare runs the OAuth flow for the client and forwards its own JWT, validated
-    // here against the team's JWKS like any other issuer).
-    let raw = headers
+    // here against the team's JWKS like any other issuer). Behind Managed OAuth both
+    // headers arrive together — `Authorization` carries the client's Cloudflare-issued
+    // access token, which is not the JWT we can verify — so every candidate must be
+    // tried, not just the first one present.
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("cf-access-jwt-assertion")
-                .and_then(|v| v.to_str().ok())
-        })?
-        .trim();
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let cf_assertion = headers
+        .get("cf-access-jwt-assertion")
+        .and_then(|v| v.to_str().ok());
     // An OIDC JWT from the configured IdP is the ONLY accepted credential on /mcp — no
     // legacy API-token fallback. Reads need any valid token; writes need `write` scope.
     let cfg = state.oidc.as_ref()?;
-    let claims = oidc::validate(cfg, raw).await?;
-    Some(AuthCtx {
-        write: claims.has_scope("write"),
-    })
+    for raw in [bearer, cf_assertion].into_iter().flatten() {
+        if let Some(claims) = oidc::validate(cfg, raw.trim()).await {
+            return Some(AuthCtx {
+                write: claims.has_scope("write"),
+            });
+        }
+    }
+    None
 }
 
 fn tool_defs() -> Value {
