@@ -2426,6 +2426,17 @@ mod roundtrip_tests {
         assert_eq!(ids(&paged), vec!["d2"]);
     }
 
+    #[test]
+    fn strip_db_scheme_resolves_the_pi_url() {
+        // The production Pi runs with TALLY_DATABASE_URL=sqlite:///app/data/state.db; this MUST
+        // resolve to the existing absolute file, not a fresh empty DB at the wrong path.
+        assert_eq!(strip_db_scheme("sqlite:///app/data/state.db"), "/app/data/state.db");
+        assert_eq!(strip_db_scheme("file:///app/data/state.db"), "/app/data/state.db");
+        assert_eq!(strip_db_scheme("sqlite:state.db"), "state.db");
+        assert_eq!(strip_db_scheme("/app/data/state.db"), "/app/data/state.db");
+        assert_eq!(strip_db_scheme("sqlite::memory:"), ":memory:");
+    }
+
     #[tokio::test]
     async fn pending_net_cents_computed() {
         let db = test_db().await;
