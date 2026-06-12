@@ -1,58 +1,128 @@
-//! Database layer. Wraps sqlx + encrypts/decrypts secrets transparently.
+//! Database layer. Wraps libsql + encrypts/decrypts secrets transparently.
+//!
+//! Migrated from sqlx to the libsql crate (Turso). Every query goes through a single shared
+//! `libsql::Connection` (held behind an Arc and cloned cheaply). Rows are mapped via the manual
+//! `FromLibsqlRow` impls in `models.rs` — by column NAME, never positional index, so join-only
+//! columns (e.g. `Account::consent_nickname`) don't misalign other SELECTs.
 
 use crate::crypto::Crypto;
 use crate::models::*;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::Utc;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{ConnectOptions, SqlitePool};
-use std::str::FromStr;
+use libsql::{params, Builder, Connection, Value};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Db {
-    pub pool: SqlitePool,
+    pub conn: Arc<Connection>,
     pub crypto: Crypto,
 }
 
+/// Collect every row of a query into `Vec<T>` using the type's `FromLibsqlRow` mapper.
+async fn map_rows<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(T::from_row(&row)?);
+    }
+    Ok(out)
+}
+
+/// Map the first row of a query (if any) using `FromLibsqlRow`.
+async fn map_opt<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Option<T>> {
+    match rows.next().await? {
+        Some(row) => Ok(Some(T::from_row(&row)?)),
+        None => Ok(None),
+    }
+}
+
 impl Db {
+    /// Connect to the configured database. The connection mode is chosen by the URL scheme of
+    /// `database_url` (the value of `TALLY_DATABASE_URL`):
+    ///
+    /// - `file:` / `sqlite:` prefix OR a bare path (the DEFAULT — Raspberry Pi / offline):
+    ///   strip the scheme to an OS path and open a local libsql database, then set
+    ///   `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`.
+    /// - `libsql://` / `wss://` / `https://` with `TALLY_DATABASE_AUTH_TOKEN` set
+    ///   (Turso / serverless): open an embedded remote replica backed by a local replica file,
+    ///   falling back to a pure remote connection. The local-file path is the supported default;
+    ///   the remote path is secondary.
     pub async fn connect(database_url: &str, crypto: Crypto) -> Result<Self> {
-        let opts = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .foreign_keys(true)
-            .log_statements(tracing::log::LevelFilter::Debug);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(opts)
+        let url = database_url.trim();
+        let is_remote = url.starts_with("libsql://")
+            || url.starts_with("wss://")
+            || url.starts_with("https://");
+
+        let conn = if is_remote {
+            let token = std::env::var("TALLY_DATABASE_AUTH_TOKEN").unwrap_or_default();
+            // Local replica file kept alongside the app data dir so reads are local and the
+            // node keeps working offline; writes replicate to the remote.
+            let replica_path = "/app/data/replica.db".to_string();
+            let db = match Builder::new_remote_replica(
+                &replica_path,
+                url.to_string(),
+                token.clone(),
+            )
+            .build()
             .await
-            .context("connecting to sqlite")?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .context("running migrations")?;
-        Ok(Self { pool, crypto })
+            {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::warn!(
+                        "remote-replica build failed ({e}); falling back to pure remote"
+                    );
+                    Builder::new_remote(url.to_string(), token)
+                        .build()
+                        .await
+                        .context("connecting to remote libsql")?
+                }
+            };
+            let conn = db.connect().context("opening remote libsql connection")?;
+            conn.execute_batch("PRAGMA foreign_keys=ON;").await.ok();
+            conn
+        } else {
+            // Strip a leading `file:` or `sqlite:` scheme down to an OS path. `sqlite://x` and
+            // `sqlite:x` both map to `x`; a bare path is used verbatim.
+            let path = strip_db_scheme(url);
+            let db = Builder::new_local(&path)
+                .build()
+                .await
+                .with_context(|| format!("opening local libsql database at {path}"))?;
+            let conn = db.connect().context("opening local libsql connection")?;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+                .await
+                .context("setting local PRAGMAs")?;
+            conn
+        };
+
+        crate::migrate::run(&conn).await.context("running migrations")?;
+        Ok(Self {
+            conn: Arc::new(conn),
+            crypto,
+        })
     }
 
     // ---------- settings ----------
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM settings WHERE key = ?1", params![key])
             .await?;
-        Ok(row.map(|r| r.0))
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES (?, ?) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .await?;
         Ok(())
     }
 
@@ -132,35 +202,41 @@ impl Db {
     // ---------- consents ----------
 
     pub async fn list_consents(&self) -> Result<Vec<Consent>> {
-        Ok(sqlx::query_as::<_, Consent>(
-            "SELECT * FROM consents ORDER BY nickname",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM consents ORDER BY nickname", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn list_enabled_consents(&self) -> Result<Vec<Consent>> {
-        Ok(sqlx::query_as::<_, Consent>(
-            "SELECT * FROM consents WHERE enabled = 1 ORDER BY nickname",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM consents WHERE enabled = 1 ORDER BY nickname",
+                (),
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn get_consent(&self, id: i64) -> Result<Option<Consent>> {
-        Ok(sqlx::query_as::<_, Consent>("SELECT * FROM consents WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM consents WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
     }
 
     pub async fn get_consent_by_nickname(&self, nickname: &str) -> Result<Option<Consent>> {
-        Ok(
-            sqlx::query_as::<_, Consent>("SELECT * FROM consents WHERE nickname = ?")
-                .bind(nickname)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM consents WHERE nickname = ?1",
+                params![nickname],
+            )
+            .await?;
+        map_opt(rows).await
     }
 
     /// Insert a new consent or fully replace an existing one (matched by nickname).
@@ -182,40 +258,42 @@ impl Db {
         let (rtok_nonce, rtok_ct) = self.crypto.encrypt(refresh_token)?;
         let now = Utc::now().timestamp();
 
-        sqlx::query(
-            "INSERT INTO consents (nickname, credentials_id, provider_id, provider_display_name,
-                access_token_enc, access_token_nonce, refresh_token_enc, refresh_token_nonce,
-                expires_at, consent_expires_at, scopes, created_at, updated_at, enabled)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-             ON CONFLICT(nickname) DO UPDATE SET
-                credentials_id = excluded.credentials_id,
-                provider_id = excluded.provider_id,
-                provider_display_name = excluded.provider_display_name,
-                access_token_enc = excluded.access_token_enc,
-                access_token_nonce = excluded.access_token_nonce,
-                refresh_token_enc = excluded.refresh_token_enc,
-                refresh_token_nonce = excluded.refresh_token_nonce,
-                expires_at = excluded.expires_at,
-                consent_expires_at = excluded.consent_expires_at,
-                scopes = excluded.scopes,
-                updated_at = excluded.updated_at,
-                enabled = 1",
-        )
-        .bind(nickname)
-        .bind(credentials_id)
-        .bind(provider_id)
-        .bind(provider_display_name)
-        .bind(&atok_ct)
-        .bind(&atok_nonce)
-        .bind(&rtok_ct)
-        .bind(&rtok_nonce)
-        .bind(expires_at)
-        .bind(consent_expires_at)
-        .bind(scopes)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO consents (nickname, credentials_id, provider_id, provider_display_name,
+                    access_token_enc, access_token_nonce, refresh_token_enc, refresh_token_nonce,
+                    expires_at, consent_expires_at, scopes, created_at, updated_at, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)
+                 ON CONFLICT(nickname) DO UPDATE SET
+                    credentials_id = excluded.credentials_id,
+                    provider_id = excluded.provider_id,
+                    provider_display_name = excluded.provider_display_name,
+                    access_token_enc = excluded.access_token_enc,
+                    access_token_nonce = excluded.access_token_nonce,
+                    refresh_token_enc = excluded.refresh_token_enc,
+                    refresh_token_nonce = excluded.refresh_token_nonce,
+                    expires_at = excluded.expires_at,
+                    consent_expires_at = excluded.consent_expires_at,
+                    scopes = excluded.scopes,
+                    updated_at = excluded.updated_at,
+                    enabled = 1",
+                params![
+                    nickname,
+                    credentials_id,
+                    provider_id,
+                    provider_display_name,
+                    atok_ct,
+                    atok_nonce,
+                    rtok_ct,
+                    rtok_nonce,
+                    expires_at,
+                    consent_expires_at,
+                    scopes,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
 
         self.get_consent_by_nickname(nickname)
             .await?
@@ -232,22 +310,24 @@ impl Db {
     ) -> Result<()> {
         let (atok_nonce, atok_ct) = self.crypto.encrypt(access_token)?;
         let (rtok_nonce, rtok_ct) = self.crypto.encrypt(refresh_token)?;
-        sqlx::query(
-            "UPDATE consents SET
-                access_token_enc = ?, access_token_nonce = ?,
-                refresh_token_enc = ?, refresh_token_nonce = ?,
-                expires_at = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(&atok_ct)
-        .bind(&atok_nonce)
-        .bind(&rtok_ct)
-        .bind(&rtok_nonce)
-        .bind(expires_at)
-        .bind(Utc::now().timestamp())
-        .bind(consent_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE consents SET
+                    access_token_enc = ?1, access_token_nonce = ?2,
+                    refresh_token_enc = ?3, refresh_token_nonce = ?4,
+                    expires_at = ?5, updated_at = ?6
+                 WHERE id = ?7",
+                params![
+                    atok_ct,
+                    atok_nonce,
+                    rtok_ct,
+                    rtok_nonce,
+                    expires_at,
+                    Utc::now().timestamp(),
+                    consent_id,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -263,19 +343,25 @@ impl Db {
     }
 
     pub async fn set_consent_enabled(&self, consent_id: i64, enabled: bool) -> Result<()> {
-        sqlx::query("UPDATE consents SET enabled = ?, updated_at = ? WHERE id = ?")
-            .bind(if enabled { 1 } else { 0 })
-            .bind(Utc::now().timestamp())
-            .bind(consent_id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE consents SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    if enabled { 1_i64 } else { 0 },
+                    Utc::now().timestamp(),
+                    consent_id,
+                ],
+            )
             .await?;
         Ok(())
     }
 
     pub async fn delete_consent(&self, consent_id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM consents WHERE id = ?")
-            .bind(consent_id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "DELETE FROM consents WHERE id = ?1",
+                params![consent_id],
+            )
             .await?;
         Ok(())
     }
@@ -286,43 +372,48 @@ impl Db {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE consents SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ? WHERE id = ?",
-        )
-        .bind(Utc::now().timestamp())
-        .bind(status)
-        .bind(error)
-        .bind(consent_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE consents SET last_sync_at = ?1, last_sync_status = ?2, last_sync_error = ?3 WHERE id = ?4",
+                params![Utc::now().timestamp(), status, error, consent_id],
+            )
+            .await?;
         Ok(())
     }
 
     // ---------- accounts ----------
 
     pub async fn list_accounts_for_consent(&self, consent_id: i64) -> Result<Vec<Account>> {
-        Ok(sqlx::query_as::<_, Account>(
-            "SELECT * FROM accounts WHERE consent_id = ? ORDER BY kind, display_name",
-        )
-        .bind(consent_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM accounts WHERE consent_id = ?1 ORDER BY kind, display_name",
+                params![consent_id],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn list_all_enabled_accounts(&self) -> Result<Vec<Account>> {
-        Ok(sqlx::query_as::<_, Account>(
-            "SELECT a.*, c.nickname AS consent_nickname,
-                (SELECT COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN t.amount_cents
-                                          ELSE -t.amount_cents END), 0)
-                 FROM transactions t WHERE t.account_id = a.id AND t.is_pending = 1)
-                    AS pending_net_cents
-             FROM accounts a
-             INNER JOIN consents c ON c.id = a.consent_id
-             WHERE a.enabled = 1 AND c.enabled = 1
-             ORDER BY a.kind, a.display_name",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        // This is the ONLY SELECT that adds `consent_nickname` and `pending_net_cents` columns;
+        // the Account mapper resolves them via the absent-tolerant path, so all other Account
+        // SELECTs (which lack these columns) still map cleanly.
+        let rows = self
+            .conn
+            .query(
+                "SELECT a.*, c.nickname AS consent_nickname,
+                    (SELECT COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN t.amount_cents
+                                              ELSE -t.amount_cents END), 0)
+                     FROM transactions t WHERE t.account_id = a.id AND t.is_pending = 1)
+                        AS pending_net_cents
+                 FROM accounts a
+                 INNER JOIN consents c ON c.id = a.consent_id
+                 WHERE a.enabled = 1 AND c.enabled = 1
+                 ORDER BY a.kind, a.display_name",
+                (),
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -339,40 +430,45 @@ impl Db {
         currency: &str,
     ) -> Result<Account> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO accounts (consent_id, truelayer_id, kind, display_name, iban, sort_code,
-                account_number, card_last4, currency, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-             ON CONFLICT(consent_id, truelayer_id) DO UPDATE SET
-                display_name = excluded.display_name,
-                iban = excluded.iban,
-                sort_code = excluded.sort_code,
-                account_number = excluded.account_number,
-                card_last4 = excluded.card_last4,
-                currency = excluded.currency,
-                updated_at = excluded.updated_at",
-        )
-        .bind(consent_id)
-        .bind(truelayer_id)
-        .bind(kind)
-        .bind(display_name)
-        .bind(iban)
-        .bind(sort_code)
-        .bind(account_number)
-        .bind(card_last4)
-        .bind(currency)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO accounts (consent_id, truelayer_id, kind, display_name, iban, sort_code,
+                    account_number, card_last4, currency, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)
+                 ON CONFLICT(consent_id, truelayer_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    iban = excluded.iban,
+                    sort_code = excluded.sort_code,
+                    account_number = excluded.account_number,
+                    card_last4 = excluded.card_last4,
+                    currency = excluded.currency,
+                    updated_at = excluded.updated_at",
+                params![
+                    consent_id,
+                    truelayer_id,
+                    kind,
+                    display_name,
+                    iban,
+                    sort_code,
+                    account_number,
+                    card_last4,
+                    currency,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
 
-        Ok(sqlx::query_as::<_, Account>(
-            "SELECT * FROM accounts WHERE consent_id = ? AND truelayer_id = ?",
-        )
-        .bind(consent_id)
-        .bind(truelayer_id)
-        .fetch_one(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM accounts WHERE consent_id = ?1 AND truelayer_id = ?2",
+                params![consent_id, truelayer_id],
+            )
+            .await?;
+        map_opt(rows)
+            .await?
+            .context("account disappeared after upsert")
     }
 
     pub async fn map_account_to_firefly(
@@ -380,14 +476,12 @@ impl Db {
         account_id: i64,
         firefly_account_id: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE accounts SET firefly_account_id = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(firefly_account_id)
-        .bind(Utc::now().timestamp())
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE accounts SET firefly_account_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![firefly_account_id, Utc::now().timestamp(), account_id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -400,23 +494,18 @@ impl Db {
         overdraft_cents: Option<i64>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE accounts SET
-                current_balance_cents = ?,
-                available_balance_cents = ?,
-                overdraft_cents = ?,
-                balance_updated_at = ?,
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(current_cents)
-        .bind(available_cents)
-        .bind(overdraft_cents)
-        .bind(now)
-        .bind(now)
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE accounts SET
+                    current_balance_cents = ?1,
+                    available_balance_cents = ?2,
+                    overdraft_cents = ?3,
+                    balance_updated_at = ?4,
+                    updated_at = ?5
+                 WHERE id = ?6",
+                params![current_cents, available_cents, overdraft_cents, now, now, account_id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -434,31 +523,33 @@ impl Db {
         payment_due_date: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE accounts SET
-                current_balance_cents = ?,
-                available_balance_cents = ?,
-                credit_limit_cents = ?,
-                last_statement_balance_cents = ?,
-                last_statement_date = ?,
-                payment_due_cents = ?,
-                payment_due_date = ?,
-                balance_updated_at = ?,
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(current_cents)
-        .bind(available_cents)
-        .bind(credit_limit_cents)
-        .bind(last_statement_balance_cents)
-        .bind(last_statement_date)
-        .bind(payment_due_cents)
-        .bind(payment_due_date)
-        .bind(now)
-        .bind(now)
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE accounts SET
+                    current_balance_cents = ?1,
+                    available_balance_cents = ?2,
+                    credit_limit_cents = ?3,
+                    last_statement_balance_cents = ?4,
+                    last_statement_date = ?5,
+                    payment_due_cents = ?6,
+                    payment_due_date = ?7,
+                    balance_updated_at = ?8,
+                    updated_at = ?9
+                 WHERE id = ?10",
+                params![
+                    current_cents,
+                    available_cents,
+                    credit_limit_cents,
+                    last_statement_balance_cents,
+                    last_statement_date,
+                    payment_due_cents,
+                    payment_due_date,
+                    now,
+                    now,
+                    account_id,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -470,21 +561,17 @@ impl Db {
         card_network: Option<&str>,
         name_on_card: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE accounts SET
-                account_type = COALESCE(?, account_type),
-                card_network = COALESCE(?, card_network),
-                name_on_card = COALESCE(?, name_on_card),
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(account_type)
-        .bind(card_network)
-        .bind(name_on_card)
-        .bind(Utc::now().timestamp())
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE accounts SET
+                    account_type = COALESCE(?1, account_type),
+                    card_network = COALESCE(?2, card_network),
+                    name_on_card = COALESCE(?3, name_on_card),
+                    updated_at = ?4
+                 WHERE id = ?5",
+                params![account_type, card_network, name_on_card, Utc::now().timestamp(), account_id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -495,14 +582,12 @@ impl Db {
         account_id: i64,
         custom: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE accounts SET custom_display_name = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(custom)
-        .bind(Utc::now().timestamp())
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE accounts SET custom_display_name = ?1, updated_at = ?2 WHERE id = ?3",
+                params![custom, Utc::now().timestamp(), account_id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -515,11 +600,11 @@ impl Db {
         if cleaned.is_empty() {
             return Err(anyhow::anyhow!("nickname cannot be empty"));
         }
-        sqlx::query("UPDATE consents SET nickname = ?, updated_at = ? WHERE id = ?")
-            .bind(&cleaned)
-            .bind(Utc::now().timestamp())
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE consents SET nickname = ?1, updated_at = ?2 WHERE id = ?3",
+                params![cleaned, Utc::now().timestamp(), id],
+            )
             .await?;
         Ok(())
     }
@@ -527,14 +612,14 @@ impl Db {
     // ---------- transactions_seen ----------
 
     pub async fn is_txn_seen(&self, account_id: i64, truelayer_txn_id: &str) -> Result<bool> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM transactions_seen WHERE account_id = ? AND truelayer_txn_id = ?",
-        )
-        .bind(account_id)
-        .bind(truelayer_txn_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.is_some())
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM transactions_seen WHERE account_id = ?1 AND truelayer_txn_id = ?2",
+                params![account_id, truelayer_txn_id],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
     }
 
     pub async fn record_txn_imported(
@@ -545,21 +630,23 @@ impl Db {
         is_pending: bool,
         raw_json: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO transactions_seen (account_id, truelayer_txn_id, firefly_txn_id, is_pending, raw_json, imported_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_id, truelayer_txn_id) DO UPDATE SET
-                firefly_txn_id = COALESCE(excluded.firefly_txn_id, transactions_seen.firefly_txn_id),
-                is_pending = excluded.is_pending",
-        )
-        .bind(account_id)
-        .bind(truelayer_txn_id)
-        .bind(firefly_txn_id)
-        .bind(if is_pending { 1 } else { 0 })
-        .bind(raw_json)
-        .bind(Utc::now().timestamp())
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO transactions_seen (account_id, truelayer_txn_id, firefly_txn_id, is_pending, raw_json, imported_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(account_id, truelayer_txn_id) DO UPDATE SET
+                    firefly_txn_id = COALESCE(excluded.firefly_txn_id, transactions_seen.firefly_txn_id),
+                    is_pending = excluded.is_pending",
+                params![
+                    account_id,
+                    truelayer_txn_id,
+                    firefly_txn_id,
+                    if is_pending { 1_i64 } else { 0 },
+                    raw_json,
+                    Utc::now().timestamp(),
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -578,40 +665,44 @@ impl Db {
         next_payment_date: Option<&str>,
         status: Option<&str>,
     ) -> Result<RecurringEntry> {
-        sqlx::query(
-            "INSERT INTO recurring (account_id, truelayer_id, kind, name, amount, currency,
-                frequency, next_payment_date, status, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_id, truelayer_id, kind) DO UPDATE SET
-                name = excluded.name,
-                amount = excluded.amount,
-                currency = excluded.currency,
-                frequency = excluded.frequency,
-                next_payment_date = excluded.next_payment_date,
-                status = excluded.status,
-                last_seen_at = excluded.last_seen_at",
-        )
-        .bind(account_id)
-        .bind(truelayer_id)
-        .bind(kind)
-        .bind(name)
-        .bind(amount)
-        .bind(currency)
-        .bind(frequency)
-        .bind(next_payment_date)
-        .bind(status)
-        .bind(Utc::now().timestamp())
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO recurring (account_id, truelayer_id, kind, name, amount, currency,
+                    frequency, next_payment_date, status, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(account_id, truelayer_id, kind) DO UPDATE SET
+                    name = excluded.name,
+                    amount = excluded.amount,
+                    currency = excluded.currency,
+                    frequency = excluded.frequency,
+                    next_payment_date = excluded.next_payment_date,
+                    status = excluded.status,
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    account_id,
+                    truelayer_id,
+                    kind,
+                    name,
+                    amount,
+                    currency,
+                    frequency,
+                    next_payment_date,
+                    status,
+                    Utc::now().timestamp(),
+                ],
+            )
+            .await?;
 
-        Ok(sqlx::query_as::<_, RecurringEntry>(
-            "SELECT * FROM recurring WHERE account_id = ? AND truelayer_id = ? AND kind = ?",
-        )
-        .bind(account_id)
-        .bind(truelayer_id)
-        .bind(kind)
-        .fetch_one(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM recurring WHERE account_id = ?1 AND truelayer_id = ?2 AND kind = ?3",
+                params![account_id, truelayer_id, kind],
+            )
+            .await?;
+        map_opt(rows)
+            .await?
+            .context("recurring disappeared after upsert")
     }
 
     pub async fn map_recurring_to_firefly_bill(
@@ -619,34 +710,36 @@ impl Db {
         recurring_id: i64,
         firefly_bill_id: i64,
     ) -> Result<()> {
-        sqlx::query("UPDATE recurring SET firefly_bill_id = ? WHERE id = ?")
-            .bind(firefly_bill_id)
-            .bind(recurring_id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE recurring SET firefly_bill_id = ?1 WHERE id = ?2",
+                params![firefly_bill_id, recurring_id],
+            )
             .await?;
         Ok(())
     }
 
     pub async fn list_recurring_for_account(&self, account_id: i64) -> Result<Vec<RecurringEntry>> {
-        Ok(sqlx::query_as::<_, RecurringEntry>(
-            "SELECT * FROM recurring WHERE account_id = ? ORDER BY kind, name",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM recurring WHERE account_id = ?1 ORDER BY kind, name",
+                params![account_id],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     // ---------- sync_log ----------
 
     pub async fn start_sync_log(&self, consent_id: Option<i64>) -> Result<i64> {
-        let result = sqlx::query(
-            "INSERT INTO sync_log (consent_id, started_at, status) VALUES (?, ?, 'in_progress')",
-        )
-        .bind(consent_id)
-        .bind(Utc::now().timestamp())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.last_insert_rowid())
+        self.conn
+            .execute(
+                "INSERT INTO sync_log (consent_id, started_at, status) VALUES (?1, ?2, 'in_progress')",
+                params![consent_id, Utc::now().timestamp()],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -660,68 +753,81 @@ impl Db {
         recurring: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE sync_log SET ended_at = ?, status = ?, accounts_synced = ?,
-                transactions_imported = ?, transactions_skipped = ?,
-                recurring_imported = ?, error_message = ?
-             WHERE id = ?",
-        )
-        .bind(Utc::now().timestamp())
-        .bind(status)
-        .bind(accounts)
-        .bind(imported)
-        .bind(skipped)
-        .bind(recurring)
-        .bind(error)
-        .bind(log_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE sync_log SET ended_at = ?1, status = ?2, accounts_synced = ?3,
+                    transactions_imported = ?4, transactions_skipped = ?5,
+                    recurring_imported = ?6, error_message = ?7
+                 WHERE id = ?8",
+                params![
+                    Utc::now().timestamp(),
+                    status,
+                    accounts,
+                    imported,
+                    skipped,
+                    recurring,
+                    error,
+                    log_id,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn recent_sync_logs(&self, limit: i64) -> Result<Vec<SyncLogEntry>> {
-        Ok(sqlx::query_as::<_, SyncLogEntry>(
-            "SELECT * FROM sync_log ORDER BY started_at DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM sync_log ORDER BY started_at DESC LIMIT ?1",
+                params![limit],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     // ---------- oauth_states ----------
 
     pub async fn save_oauth_state(&self, state: &str, nickname: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO oauth_states (state, nickname, created_at) VALUES (?, ?, ?)",
-        )
-        .bind(state)
-        .bind(nickname)
-        .bind(Utc::now().timestamp())
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO oauth_states (state, nickname, created_at) VALUES (?1, ?2, ?3)",
+                params![state, nickname, Utc::now().timestamp()],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn consume_oauth_state(&self, state: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT nickname FROM oauth_states WHERE state = ?",
-        )
-        .bind(state)
-        .fetch_optional(&self.pool)
-        .await?;
-        if row.is_some() {
-            sqlx::query("DELETE FROM oauth_states WHERE state = ?")
-                .bind(state)
-                .execute(&self.pool)
+        let nickname: Option<String> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT nickname FROM oauth_states WHERE state = ?1",
+                    params![state],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<String>(0)?),
+                None => None,
+            }
+        };
+        if nickname.is_some() {
+            self.conn
+                .execute(
+                    "DELETE FROM oauth_states WHERE state = ?1",
+                    params![state],
+                )
                 .await?;
             // Garbage-collect old states (> 10 min)
             let cutoff = Utc::now().timestamp() - 600;
-            sqlx::query("DELETE FROM oauth_states WHERE created_at < ?")
-                .bind(cutoff)
-                .execute(&self.pool)
+            self.conn
+                .execute(
+                    "DELETE FROM oauth_states WHERE created_at < ?1",
+                    params![cutoff],
+                )
                 .await?;
         }
-        Ok(row.map(|r| r.0))
+        Ok(nickname)
     }
 
     // ============================================================
@@ -747,51 +853,59 @@ impl Db {
         raw_json: Option<&str>,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO transactions (account_id, provider_txn_id, timestamp, description,
-                amount_cents, currency, is_credit, is_pending, merchant_name,
-                counterparty_iban, counterparty_name, category_id, notes, raw_json,
-                created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_id, provider_txn_id) DO UPDATE SET
-                timestamp = excluded.timestamp,
-                description = excluded.description,
-                amount_cents = excluded.amount_cents,
-                is_credit = excluded.is_credit,
-                is_pending = excluded.is_pending,
-                merchant_name = COALESCE(excluded.merchant_name, transactions.merchant_name),
-                counterparty_iban = COALESCE(excluded.counterparty_iban, transactions.counterparty_iban),
-                counterparty_name = COALESCE(excluded.counterparty_name, transactions.counterparty_name),
-                raw_json = COALESCE(excluded.raw_json, transactions.raw_json),
-                updated_at = excluded.updated_at
-             RETURNING id",
-        )
-        .bind(account_id)
-        .bind(provider_txn_id)
-        .bind(timestamp)
-        .bind(description)
-        .bind(amount_cents)
-        .bind(currency)
-        .bind(if is_credit { 1 } else { 0 })
-        .bind(if is_pending { 1 } else { 0 })
-        .bind(merchant_name)
-        .bind(counterparty_iban)
-        .bind(counterparty_name)
-        .bind(category_id)
-        .bind(notes)
-        .bind(raw_json)
-        .bind(now)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO transactions (account_id, provider_txn_id, timestamp, description,
+                    amount_cents, currency, is_credit, is_pending, merchant_name,
+                    counterparty_iban, counterparty_name, category_id, notes, raw_json,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(account_id, provider_txn_id) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    description = excluded.description,
+                    amount_cents = excluded.amount_cents,
+                    is_credit = excluded.is_credit,
+                    is_pending = excluded.is_pending,
+                    merchant_name = COALESCE(excluded.merchant_name, transactions.merchant_name),
+                    counterparty_iban = COALESCE(excluded.counterparty_iban, transactions.counterparty_iban),
+                    counterparty_name = COALESCE(excluded.counterparty_name, transactions.counterparty_name),
+                    raw_json = COALESCE(excluded.raw_json, transactions.raw_json),
+                    updated_at = excluded.updated_at
+                 RETURNING id",
+                params![
+                    account_id,
+                    provider_txn_id,
+                    timestamp,
+                    description,
+                    amount_cents,
+                    currency,
+                    if is_credit { 1_i64 } else { 0 },
+                    if is_pending { 1_i64 } else { 0 },
+                    merchant_name,
+                    counterparty_iban,
+                    counterparty_name,
+                    category_id,
+                    notes,
+                    raw_json,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .context("upsert_transaction RETURNING id produced no row")?;
+        Ok(row.get::<i64>(0)?)
     }
 
     pub async fn get_transaction(&self, id: i64) -> Result<Option<Transaction>> {
-        Ok(sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM transactions WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
     }
 
     pub async fn update_transaction_category(
@@ -799,23 +913,21 @@ impl Db {
         id: i64,
         category_id: Option<i64>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE transactions SET category_id = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(category_id)
-        .bind(Utc::now().timestamp())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE transactions SET category_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![category_id, Utc::now().timestamp(), id],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn update_transaction_notes(&self, id: i64, notes: Option<&str>) -> Result<()> {
-        sqlx::query("UPDATE transactions SET notes = ?, updated_at = ? WHERE id = ?")
-            .bind(notes)
-            .bind(Utc::now().timestamp())
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE transactions SET notes = ?1, updated_at = ?2 WHERE id = ?3",
+                params![notes, Utc::now().timestamp(), id],
+            )
             .await?;
         Ok(())
     }
@@ -836,61 +948,59 @@ impl Db {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Transaction>> {
+        // Dynamic SQL: build the positional bind list in EXACTLY the order the placeholders are
+        // appended (ints first, then the two LIKE strings, then limit/offset) — mirroring the old
+        // sqlx .bind() chain. `?` positional placeholders are matched left-to-right by libsql.
         let mut q = String::from("SELECT * FROM transactions WHERE 1=1");
-        let mut binds: Vec<String> = Vec::new();
-        let mut int_binds: Vec<i64> = Vec::new();
+        let mut binds: Vec<Value> = Vec::new();
 
         if let Some(aids) = account_ids {
             if !aids.is_empty() {
                 let placeholders = vec!["?"; aids.len()].join(",");
                 q.push_str(&format!(" AND account_id IN ({placeholders})"));
-                int_binds.extend(aids.iter().copied());
+                binds.extend(aids.iter().map(|v| Value::from(*v)));
             }
         }
         if let Some(cids) = category_ids {
             if !cids.is_empty() {
                 let placeholders = vec!["?"; cids.len()].join(",");
                 q.push_str(&format!(" AND category_id IN ({placeholders})"));
-                int_binds.extend(cids.iter().copied());
+                binds.extend(cids.iter().map(|v| Value::from(*v)));
             }
         }
-        if from_ts.is_some() {
+        if let Some(f) = from_ts {
             q.push_str(" AND timestamp >= ?");
-            int_binds.push(from_ts.unwrap());
+            binds.push(Value::from(f));
         }
-        if to_ts.is_some() {
+        if let Some(t) = to_ts {
             q.push_str(" AND timestamp <= ?");
-            int_binds.push(to_ts.unwrap());
+            binds.push(Value::from(t));
         }
-        if min_amount_cents.is_some() {
+        if let Some(m) = min_amount_cents {
             q.push_str(" AND amount_cents >= ?");
-            int_binds.push(min_amount_cents.unwrap());
+            binds.push(Value::from(m));
         }
-        if max_amount_cents.is_some() {
+        if let Some(m) = max_amount_cents {
             q.push_str(" AND amount_cents <= ?");
-            int_binds.push(max_amount_cents.unwrap());
+            binds.push(Value::from(m));
         }
         if let Some(c) = is_credit {
             q.push_str(" AND is_credit = ?");
-            int_binds.push(if c { 1 } else { 0 });
+            binds.push(Value::from(if c { 1_i64 } else { 0 }));
         }
         if let Some(d) = description_like {
             q.push_str(" AND (description LIKE ? OR merchant_name LIKE ?)");
             let pat = format!("%{}%", d);
-            binds.push(pat.clone());
-            binds.push(pat);
+            binds.push(Value::from(pat.clone()));
+            binds.push(Value::from(pat));
         }
 
         q.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
-        let mut query = sqlx::query_as::<_, Transaction>(&q);
-        for v in int_binds {
-            query = query.bind(v);
-        }
-        for v in &binds {
-            query = query.bind(v);
-        }
-        query = query.bind(limit).bind(offset);
-        Ok(query.fetch_all(&self.pool).await?)
+        binds.push(Value::from(limit));
+        binds.push(Value::from(offset));
+
+        let rows = self.conn.query(&q, binds).await?;
+        map_rows(rows).await
     }
 
     pub async fn count_transactions_filtered(
@@ -900,35 +1010,37 @@ impl Db {
         from_ts: Option<i64>,
         to_ts: Option<i64>,
     ) -> Result<i64> {
+        // Same dynamic-SQL bind-order discipline as list_transactions (ints only here).
         let mut q = String::from("SELECT COUNT(*) FROM transactions WHERE 1=1");
-        let mut binds: Vec<i64> = Vec::new();
+        let mut binds: Vec<Value> = Vec::new();
         if let Some(aids) = account_ids {
             if !aids.is_empty() {
                 let p = vec!["?"; aids.len()].join(",");
                 q.push_str(&format!(" AND account_id IN ({p})"));
-                binds.extend(aids.iter().copied());
+                binds.extend(aids.iter().map(|v| Value::from(*v)));
             }
         }
         if let Some(cids) = category_ids {
             if !cids.is_empty() {
                 let p = vec!["?"; cids.len()].join(",");
                 q.push_str(&format!(" AND category_id IN ({p})"));
-                binds.extend(cids.iter().copied());
+                binds.extend(cids.iter().map(|v| Value::from(*v)));
             }
         }
         if let Some(f) = from_ts {
             q.push_str(" AND timestamp >= ?");
-            binds.push(f);
+            binds.push(Value::from(f));
         }
         if let Some(t) = to_ts {
             q.push_str(" AND timestamp <= ?");
-            binds.push(t);
+            binds.push(Value::from(t));
         }
-        let mut query = sqlx::query_as::<_, (i64,)>(&q);
-        for v in binds {
-            query = query.bind(v);
-        }
-        Ok(query.fetch_one(&self.pool).await?.0)
+        let mut rows = self.conn.query(&q, binds).await?;
+        let row = rows
+            .next()
+            .await?
+            .context("count query produced no row")?;
+        Ok(row.get::<i64>(0)?)
     }
 
     pub async fn spending_by_category(
@@ -937,17 +1049,21 @@ impl Db {
         to_ts: i64,
     ) -> Result<Vec<(Option<i64>, i64)>> {
         // Sum of withdrawal amounts per category in date range.
-        let rows: Vec<(Option<i64>, i64)> = sqlx::query_as(
-            "SELECT category_id, SUM(amount_cents) AS total_cents
-             FROM transactions
-             WHERE timestamp >= ? AND timestamp <= ? AND is_credit = 0
-             GROUP BY category_id",
-        )
-        .bind(from_ts)
-        .bind(to_ts)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT category_id, SUM(amount_cents) AS total_cents
+                 FROM transactions
+                 WHERE timestamp >= ?1 AND timestamp <= ?2 AND is_credit = 0
+                 GROUP BY category_id",
+                params![from_ts, to_ts],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get::<Option<i64>>(0)?, row.get::<i64>(1)?));
+        }
+        Ok(out)
     }
 
     // ============================================================
@@ -955,11 +1071,11 @@ impl Db {
     // ============================================================
 
     pub async fn list_categories(&self) -> Result<Vec<Category>> {
-        Ok(sqlx::query_as::<_, Category>(
-            "SELECT * FROM categories ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM categories ORDER BY name", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn create_category(
@@ -969,19 +1085,14 @@ impl Db {
         icon: Option<&str>,
         colour: Option<&str>,
     ) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO categories (name, parent_id, icon, colour, created_at)
-             VALUES (?, ?, ?, ?, ?)
-             RETURNING id",
-        )
-        .bind(name)
-        .bind(parent_id)
-        .bind(icon)
-        .bind(colour)
-        .bind(Utc::now().timestamp())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        self.conn
+            .execute(
+                "INSERT INTO categories (name, parent_id, icon, colour, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, parent_id, icon, colour, Utc::now().timestamp()],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub async fn update_category(
@@ -992,23 +1103,18 @@ impl Db {
         icon: Option<&str>,
         colour: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE categories SET name = ?, parent_id = ?, icon = ?, colour = ? WHERE id = ?",
-        )
-        .bind(name)
-        .bind(parent_id)
-        .bind(icon)
-        .bind(colour)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE categories SET name = ?1, parent_id = ?2, icon = ?3, colour = ?4 WHERE id = ?5",
+                params![name, parent_id, icon, colour, id],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn delete_category(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM categories WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM categories WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
@@ -1018,52 +1124,57 @@ impl Db {
     // ============================================================
 
     pub async fn list_tags(&self) -> Result<Vec<Tag>> {
-        Ok(sqlx::query_as::<_, Tag>("SELECT * FROM tags ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM tags ORDER BY name", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn upsert_tag(&self, name: &str) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO tags (name, created_at) VALUES (?, ?)
-             ON CONFLICT(name) DO UPDATE SET name = excluded.name
-             RETURNING id",
-        )
-        .bind(name)
-        .bind(Utc::now().timestamp())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO tags (name, created_at) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET name = excluded.name
+                 RETURNING id",
+                params![name, Utc::now().timestamp()],
+            )
+            .await?;
+        let row = rows.next().await?.context("upsert_tag RETURNING produced no row")?;
+        Ok(row.get::<i64>(0)?)
     }
 
     pub async fn tag_transaction(&self, transaction_id: i64, tag_id: i64) -> Result<()> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) VALUES (?, ?)",
-        )
-        .bind(transaction_id)
-        .bind(tag_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) VALUES (?1, ?2)",
+                params![transaction_id, tag_id],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn untag_transaction(&self, transaction_id: i64, tag_id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM transaction_tags WHERE transaction_id = ? AND tag_id = ?")
-            .bind(transaction_id)
-            .bind(tag_id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "DELETE FROM transaction_tags WHERE transaction_id = ?1 AND tag_id = ?2",
+                params![transaction_id, tag_id],
+            )
             .await?;
         Ok(())
     }
 
     pub async fn tags_for_transaction(&self, transaction_id: i64) -> Result<Vec<Tag>> {
-        Ok(sqlx::query_as::<_, Tag>(
-            "SELECT t.* FROM tags t INNER JOIN transaction_tags tt ON tt.tag_id = t.id
-             WHERE tt.transaction_id = ? ORDER BY t.name",
-        )
-        .bind(transaction_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT t.* FROM tags t INNER JOIN transaction_tags tt ON tt.tag_id = t.id
+                 WHERE tt.transaction_id = ?1 ORDER BY t.name",
+                params![transaction_id],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     // ============================================================
@@ -1076,14 +1187,16 @@ impl Db {
         } else {
             "SELECT * FROM rules ORDER BY priority ASC, id ASC"
         };
-        Ok(sqlx::query_as::<_, Rule>(q).fetch_all(&self.pool).await?)
+        let rows = self.conn.query(q, ()).await?;
+        map_rows(rows).await
     }
 
     pub async fn get_rule(&self, id: i64) -> Result<Option<Rule>> {
-        Ok(sqlx::query_as::<_, Rule>("SELECT * FROM rules WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM rules WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1102,57 +1215,56 @@ impl Db {
         set_notes: Option<&str>,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO rules (name, priority, match_description_regex, match_merchant_regex,
-                match_min_amount_cents, match_max_amount_cents, match_account_id, match_is_credit,
-                set_category_id, add_tag_ids, set_notes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id",
-        )
-        .bind(name)
-        .bind(priority)
-        .bind(match_description_regex)
-        .bind(match_merchant_regex)
-        .bind(match_min_amount_cents)
-        .bind(match_max_amount_cents)
-        .bind(match_account_id)
-        .bind(match_is_credit)
-        .bind(set_category_id)
-        .bind(add_tag_ids)
-        .bind(set_notes)
-        .bind(now)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        self.conn
+            .execute(
+                "INSERT INTO rules (name, priority, match_description_regex, match_merchant_regex,
+                    match_min_amount_cents, match_max_amount_cents, match_account_id, match_is_credit,
+                    set_category_id, add_tag_ids, set_notes, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    name,
+                    priority,
+                    match_description_regex,
+                    match_merchant_regex,
+                    match_min_amount_cents,
+                    match_max_amount_cents,
+                    match_account_id,
+                    match_is_credit,
+                    set_category_id,
+                    add_tag_ids,
+                    set_notes,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub async fn delete_rule(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM rules WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM rules WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
 
     pub async fn set_rule_enabled(&self, id: i64, enabled: bool) -> Result<()> {
-        sqlx::query("UPDATE rules SET enabled = ?, updated_at = ? WHERE id = ?")
-            .bind(if enabled { 1 } else { 0 })
-            .bind(Utc::now().timestamp())
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE rules SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                params![if enabled { 1_i64 } else { 0 }, Utc::now().timestamp(), id],
+            )
             .await?;
         Ok(())
     }
 
     pub async fn bump_rule_applied(&self, id: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE rules SET times_applied = times_applied + 1, last_applied_at = ? WHERE id = ?",
-        )
-        .bind(Utc::now().timestamp())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE rules SET times_applied = times_applied + 1, last_applied_at = ?1 WHERE id = ?2",
+                params![Utc::now().timestamp(), id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -1161,18 +1273,19 @@ impl Db {
     // ============================================================
 
     pub async fn list_budgets(&self) -> Result<Vec<Budget>> {
-        Ok(
-            sqlx::query_as::<_, Budget>("SELECT * FROM budgets ORDER BY name")
-                .fetch_all(&self.pool)
-                .await?,
-        )
+        let rows = self
+            .conn
+            .query("SELECT * FROM budgets ORDER BY name", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn get_budget(&self, id: i64) -> Result<Option<Budget>> {
-        Ok(sqlx::query_as::<_, Budget>("SELECT * FROM budgets WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM budgets WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
     }
 
     pub async fn create_budget(
@@ -1185,29 +1298,29 @@ impl Db {
         rollover: bool,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO budgets (name, category_id, amount_cents, period, currency, rollover,
-                created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id",
-        )
-        .bind(name)
-        .bind(category_id)
-        .bind(amount_cents)
-        .bind(period)
-        .bind(currency)
-        .bind(if rollover { 1 } else { 0 })
-        .bind(now)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        self.conn
+            .execute(
+                "INSERT INTO budgets (name, category_id, amount_cents, period, currency, rollover,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    name,
+                    category_id,
+                    amount_cents,
+                    period,
+                    currency,
+                    if rollover { 1_i64 } else { 0 },
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub async fn delete_budget(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM budgets WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM budgets WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
@@ -1216,16 +1329,16 @@ impl Db {
     /// containing `now`. Period is calendar-aligned for simplicity.
     pub async fn budget_period_spend(&self, budget: &Budget) -> Result<i64> {
         let (from, to) = period_range(&budget.period, Utc::now().timestamp());
-        let row: (Option<i64>,) = sqlx::query_as(
-            "SELECT SUM(amount_cents) FROM transactions
-             WHERE category_id IS ? AND is_credit = 0 AND timestamp >= ? AND timestamp <= ?",
-        )
-        .bind(budget.category_id)
-        .bind(from)
-        .bind(to)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0.unwrap_or(0))
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT SUM(amount_cents) FROM transactions
+                 WHERE category_id IS ?1 AND is_credit = 0 AND timestamp >= ?2 AND timestamp <= ?3",
+                params![budget.category_id, from, to],
+            )
+            .await?;
+        let row = rows.next().await?.context("sum query produced no row")?;
+        Ok(row.get::<Option<i64>>(0)?.unwrap_or(0))
     }
 
     // ============================================================
@@ -1233,26 +1346,27 @@ impl Db {
     // ============================================================
 
     pub async fn list_bills(&self) -> Result<Vec<Bill>> {
-        Ok(
-            sqlx::query_as::<_, Bill>("SELECT * FROM bills ORDER BY next_expected_date ASC")
-                .fetch_all(&self.pool)
-                .await?,
-        )
+        let rows = self
+            .conn
+            .query("SELECT * FROM bills ORDER BY next_expected_date ASC", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn list_bills_due_within(&self, within_days: i64) -> Result<Vec<Bill>> {
         let now = Utc::now().timestamp();
         let cutoff = now + within_days * 86_400;
-        Ok(sqlx::query_as::<_, Bill>(
-            "SELECT * FROM bills
-             WHERE enabled = 1 AND next_expected_date IS NOT NULL
-               AND next_expected_date BETWEEN ? AND ?
-             ORDER BY next_expected_date ASC",
-        )
-        .bind(now - 86_400)
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM bills
+                 WHERE enabled = 1 AND next_expected_date IS NOT NULL
+                   AND next_expected_date BETWEEN ?1 AND ?2
+                 ORDER BY next_expected_date ASC",
+                params![now - 86_400, cutoff],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1268,32 +1382,32 @@ impl Db {
         source_recurring_id: Option<i64>,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO bills (name, expected_amount_min_cents, expected_amount_max_cents,
-                currency, repeat_freq, next_expected_date, match_description_regex,
-                source_recurring_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id",
-        )
-        .bind(name)
-        .bind(amount_min_cents)
-        .bind(amount_max_cents)
-        .bind(currency)
-        .bind(repeat_freq)
-        .bind(next_expected_date)
-        .bind(match_description_regex)
-        .bind(source_recurring_id)
-        .bind(now)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        self.conn
+            .execute(
+                "INSERT INTO bills (name, expected_amount_min_cents, expected_amount_max_cents,
+                    currency, repeat_freq, next_expected_date, match_description_regex,
+                    source_recurring_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    name,
+                    amount_min_cents,
+                    amount_max_cents,
+                    currency,
+                    repeat_freq,
+                    next_expected_date,
+                    match_description_regex,
+                    source_recurring_id,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub async fn delete_bill(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM bills WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM bills WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
@@ -1301,12 +1415,17 @@ impl Db {
     /// Find the bill auto-created for a given recurring mandate (DD / standing order),
     /// so re-syncs update it in place instead of inserting a duplicate every hour.
     pub async fn bill_id_for_recurring(&self, recurring_id: i64) -> Result<Option<i64>> {
-        Ok(
-            sqlx::query_scalar("SELECT id FROM bills WHERE source_recurring_id = ? LIMIT 1")
-                .bind(recurring_id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM bills WHERE source_recurring_id = ?1 LIMIT 1",
+                params![recurring_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
     }
 
     /// Update an existing bill's expected amount window + projected next date. Used on re-sync
@@ -1318,17 +1437,19 @@ impl Db {
         amount_max_cents: i64,
         next_expected_date: Option<i64>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE bills SET expected_amount_min_cents = ?, expected_amount_max_cents = ?,
-                next_expected_date = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(amount_min_cents)
-        .bind(amount_max_cents)
-        .bind(next_expected_date)
-        .bind(Utc::now().timestamp())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE bills SET expected_amount_min_cents = ?1, expected_amount_max_cents = ?2,
+                    next_expected_date = ?3, updated_at = ?4 WHERE id = ?5",
+                params![
+                    amount_min_cents,
+                    amount_max_cents,
+                    next_expected_date,
+                    Utc::now().timestamp(),
+                    id,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -1342,17 +1463,20 @@ impl Db {
         account_id: i64,
         name_like: &str,
     ) -> Result<Option<(i64, i64)>> {
-        Ok(sqlx::query_as::<_, (i64, i64)>(
-            "SELECT amount_cents, timestamp FROM transactions
-             WHERE account_id = ? AND is_credit = 0
-               AND (description LIKE ? OR merchant_name LIKE ?)
-             ORDER BY timestamp DESC LIMIT 1",
-        )
-        .bind(account_id)
-        .bind(name_like)
-        .bind(name_like)
-        .fetch_optional(&self.pool)
-        .await?)
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT amount_cents, timestamp FROM transactions
+                 WHERE account_id = ?1 AND is_credit = 0
+                   AND (description LIKE ?2 OR merchant_name LIKE ?3)
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![account_id, name_like, name_like],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some((row.get::<i64>(0)?, row.get::<i64>(1)?))),
+            None => Ok(None),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1367,27 +1491,29 @@ impl Db {
         enabled: Option<bool>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE bills SET
-                name = COALESCE(?, name),
-                expected_amount_min_cents = COALESCE(?, expected_amount_min_cents),
-                expected_amount_max_cents = COALESCE(?, expected_amount_max_cents),
-                next_expected_date = COALESCE(?, next_expected_date),
-                match_description_regex = COALESCE(?, match_description_regex),
-                enabled = COALESCE(?, enabled),
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(name)
-        .bind(amount_min_cents)
-        .bind(amount_max_cents)
-        .bind(next_expected_date)
-        .bind(match_description_regex)
-        .bind(enabled.map(|b| if b { 1 } else { 0 }))
-        .bind(now)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE bills SET
+                    name = COALESCE(?1, name),
+                    expected_amount_min_cents = COALESCE(?2, expected_amount_min_cents),
+                    expected_amount_max_cents = COALESCE(?3, expected_amount_max_cents),
+                    next_expected_date = COALESCE(?4, next_expected_date),
+                    match_description_regex = COALESCE(?5, match_description_regex),
+                    enabled = COALESCE(?6, enabled),
+                    updated_at = ?7
+                 WHERE id = ?8",
+                params![
+                    name,
+                    amount_min_cents,
+                    amount_max_cents,
+                    next_expected_date,
+                    match_description_regex,
+                    enabled.map(|b| if b { 1_i64 } else { 0 }),
+                    now,
+                    id,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -1396,13 +1522,14 @@ impl Db {
     // ============================================================
 
     pub async fn list_reminders(&self) -> Result<Vec<Reminder>> {
-        Ok(
-            sqlx::query_as::<_, Reminder>(
+        let rows = self
+            .conn
+            .query(
                 "SELECT * FROM reminders WHERE archived = 0 ORDER BY due_at ASC",
+                (),
             )
-            .fetch_all(&self.pool)
-            .await?,
-        )
+            .await?;
+        map_rows(rows).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1422,24 +1549,26 @@ impl Db {
             anyhow::bail!("invalid freq '{freq}' (expected hours|days|weeks|months)");
         }
         let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO reminders (title, notes, freq, every_n, anchor_day, due_at,
-                notify_before, notify_enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
-        .bind(title)
-        .bind(notes)
-        .bind(freq)
-        .bind(every_n)
-        .bind(anchor_day)
-        .bind(due_at)
-        .bind(notify_before)
-        .bind(if notify_enabled { 1 } else { 0 })
-        .bind(now)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        self.conn
+            .execute(
+                "INSERT INTO reminders (title, notes, freq, every_n, anchor_day, due_at,
+                    notify_before, notify_enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    title,
+                    notes,
+                    freq,
+                    every_n,
+                    anchor_day,
+                    due_at,
+                    notify_before,
+                    if notify_enabled { 1_i64 } else { 0 },
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub async fn update_reminder(
@@ -1451,100 +1580,103 @@ impl Db {
         notify_enabled: Option<bool>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE reminders SET
-                title = COALESCE(?, title),
-                notes = COALESCE(?, notes),
-                notify_before = COALESCE(?, notify_before),
-                notify_enabled = COALESCE(?, notify_enabled),
-                updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(title)
-        .bind(notes)
-        .bind(notify_before)
-        .bind(notify_enabled.map(|b| if b { 1 } else { 0 }))
-        .bind(now)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE reminders SET
+                    title = COALESCE(?1, title),
+                    notes = COALESCE(?2, notes),
+                    notify_before = COALESCE(?3, notify_before),
+                    notify_enabled = COALESCE(?4, notify_enabled),
+                    updated_at = ?5
+                 WHERE id = ?6",
+                params![
+                    title,
+                    notes,
+                    notify_before,
+                    notify_enabled.map(|b| if b { 1_i64 } else { 0 }),
+                    now,
+                    id,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn tick_reminder(&self, id: i64) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query("UPDATE reminders SET completed_at = ?, updated_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE reminders SET completed_at = ?1, updated_at = ?2 WHERE id = ?3",
+                params![now, now, id],
+            )
             .await?;
         Ok(())
     }
 
     pub async fn untick_reminder(&self, id: i64) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query("UPDATE reminders SET completed_at = NULL, updated_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE reminders SET completed_at = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
             .await?;
         Ok(())
     }
 
     pub async fn delete_reminder(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM reminders WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM reminders WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
 
     /// Active, enabled reminders within their notify window not yet ticked or pinged this period.
     pub async fn reminders_to_notify(&self, now: i64) -> Result<Vec<Reminder>> {
-        Ok(sqlx::query_as::<_, Reminder>(
-            "SELECT * FROM reminders
-             WHERE archived = 0 AND notify_enabled = 1
-               AND completed_at IS NULL AND notified_at IS NULL
-               AND ? >= due_at - notify_before",
-        )
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM reminders
+                 WHERE archived = 0 AND notify_enabled = 1
+                   AND completed_at IS NULL AND notified_at IS NULL
+                   AND ?1 >= due_at - notify_before",
+                params![now],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn mark_reminder_notified(&self, id: i64, now: i64) -> Result<()> {
-        sqlx::query("UPDATE reminders SET notified_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "UPDATE reminders SET notified_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
             .await?;
         Ok(())
     }
 
     /// Reminders whose current period has elapsed and need rolling to the next deadline.
     pub async fn reminders_to_roll(&self, now: i64) -> Result<Vec<Reminder>> {
-        Ok(
-            sqlx::query_as::<_, Reminder>(
-                "SELECT * FROM reminders WHERE archived = 0 AND ? >= due_at",
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM reminders WHERE archived = 0 AND ?1 >= due_at",
+                params![now],
             )
-            .bind(now)
-            .fetch_all(&self.pool)
-            .await?,
-        )
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn roll_reminder(&self, id: i64, next_due: i64) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE reminders SET due_at = ?, completed_at = NULL, notified_at = NULL,
-                updated_at = ? WHERE id = ?",
-        )
-        .bind(next_due)
-        .bind(now)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE reminders SET due_at = ?1, completed_at = NULL, notified_at = NULL,
+                    updated_at = ?2 WHERE id = ?3",
+                params![next_due, now, id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -1553,11 +1685,11 @@ impl Db {
     // ============================================================
 
     pub async fn list_brokers(&self) -> Result<Vec<Broker>> {
-        Ok(sqlx::query_as::<_, Broker>(
-            "SELECT * FROM brokers ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM brokers ORDER BY name", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn upsert_broker(
@@ -1567,65 +1699,67 @@ impl Db {
         currency: &str,
         notes: Option<&str>,
     ) -> Result<i64> {
-        let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO brokers (name, kind, currency, notes, created_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET
-                kind = excluded.kind,
-                currency = excluded.currency,
-                notes = excluded.notes
-             RETURNING id",
-        )
-        .bind(name)
-        .bind(kind)
-        .bind(currency)
-        .bind(notes)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO brokers (name, kind, currency, notes, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(name) DO UPDATE SET
+                    kind = excluded.kind,
+                    currency = excluded.currency,
+                    notes = excluded.notes
+                 RETURNING id",
+                params![name, kind, currency, notes, Utc::now().timestamp()],
+            )
+            .await?;
+        let row = rows.next().await?.context("upsert_broker RETURNING produced no row")?;
+        Ok(row.get::<i64>(0)?)
     }
 
     pub async fn delete_broker(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM brokers WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM brokers WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
 
     pub async fn list_holdings(&self) -> Result<Vec<Holding>> {
-        Ok(sqlx::query_as::<_, Holding>(
-            "SELECT * FROM holdings WHERE enabled = 1 ORDER BY symbol",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM holdings WHERE enabled = 1 ORDER BY symbol", ())
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn list_holdings_for_broker(&self, broker_id: i64) -> Result<Vec<Holding>> {
-        Ok(sqlx::query_as::<_, Holding>(
-            "SELECT * FROM holdings WHERE broker_id = ? AND enabled = 1 ORDER BY symbol",
-        )
-        .bind(broker_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM holdings WHERE broker_id = ?1 AND enabled = 1 ORDER BY symbol",
+                params![broker_id],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     pub async fn get_holding(&self, id: i64) -> Result<Option<Holding>> {
-        Ok(sqlx::query_as::<_, Holding>("SELECT * FROM holdings WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM holdings WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
     }
 
     pub async fn distinct_symbols(&self) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT symbol FROM holdings WHERE enabled = 1",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.0).collect())
+        let mut rows = self
+            .conn
+            .query("SELECT DISTINCT symbol FROM holdings WHERE enabled = 1", ())
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1640,60 +1774,63 @@ impl Db {
         name: Option<&str>,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO holdings (broker_id, symbol, asset_class, quantity, avg_cost_per_unit,
-                currency, name, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(broker_id, symbol) DO UPDATE SET
-                asset_class = excluded.asset_class,
-                quantity = excluded.quantity,
-                avg_cost_per_unit = excluded.avg_cost_per_unit,
-                currency = excluded.currency,
-                name = COALESCE(excluded.name, holdings.name),
-                updated_at = excluded.updated_at
-             RETURNING id",
-        )
-        .bind(broker_id)
-        .bind(symbol)
-        .bind(asset_class)
-        .bind(quantity)
-        .bind(avg_cost)
-        .bind(currency)
-        .bind(name)
-        .bind(now)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO holdings (broker_id, symbol, asset_class, quantity, avg_cost_per_unit,
+                    currency, name, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(broker_id, symbol) DO UPDATE SET
+                    asset_class = excluded.asset_class,
+                    quantity = excluded.quantity,
+                    avg_cost_per_unit = excluded.avg_cost_per_unit,
+                    currency = excluded.currency,
+                    name = COALESCE(excluded.name, holdings.name),
+                    updated_at = excluded.updated_at
+                 RETURNING id",
+                params![
+                    broker_id,
+                    symbol,
+                    asset_class,
+                    quantity,
+                    avg_cost,
+                    currency,
+                    name,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        let row = rows.next().await?.context("upsert_holding RETURNING produced no row")?;
+        Ok(row.get::<i64>(0)?)
     }
 
     pub async fn delete_holding(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM holdings WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM holdings WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
 
     pub async fn touch_holding_synced(&self, id: i64, name: Option<&str>) -> Result<()> {
-        sqlx::query(
-            "UPDATE holdings SET last_synced_at = ?, name = COALESCE(?, name) WHERE id = ?",
-        )
-        .bind(Utc::now().timestamp())
-        .bind(name)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE holdings SET last_synced_at = ?1, name = COALESCE(?2, name) WHERE id = ?3",
+                params![Utc::now().timestamp(), name, id],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn list_activities(&self, holding_id: i64) -> Result<Vec<HoldingActivity>> {
-        Ok(sqlx::query_as::<_, HoldingActivity>(
-            "SELECT * FROM holding_activities WHERE holding_id = ? ORDER BY timestamp DESC",
-        )
-        .bind(holding_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM holding_activities WHERE holding_id = ?1 ORDER BY timestamp DESC",
+                params![holding_id],
+            )
+            .await?;
+        map_rows(rows).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1709,30 +1846,30 @@ impl Db {
         notes: Option<&str>,
     ) -> Result<i64> {
         validate_activity(activity_type, quantity, price_per_unit, fee)?;
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO holding_activities (holding_id, activity_type, timestamp, quantity,
-                price_per_unit, fee, currency, notes, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id",
-        )
-        .bind(holding_id)
-        .bind(activity_type)
-        .bind(timestamp)
-        .bind(quantity)
-        .bind(price_per_unit)
-        .bind(fee)
-        .bind(currency)
-        .bind(notes)
-        .bind(Utc::now().timestamp())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
+        self.conn
+            .execute(
+                "INSERT INTO holding_activities (holding_id, activity_type, timestamp, quantity,
+                    price_per_unit, fee, currency, notes, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    holding_id,
+                    activity_type,
+                    timestamp,
+                    quantity,
+                    price_per_unit,
+                    fee,
+                    currency,
+                    notes,
+                    Utc::now().timestamp(),
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub async fn delete_activity(&self, id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM holding_activities WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        self.conn
+            .execute("DELETE FROM holding_activities WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }
@@ -1751,28 +1888,62 @@ impl Db {
         notes: Option<&str>,
     ) -> Result<Option<i64>> {
         validate_activity(activity_type, quantity, price_per_unit, fee)?;
-        let holding_id: Option<i64> =
-            sqlx::query_scalar("SELECT holding_id FROM holding_activities WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let holding_id = self.holding_id_for_activity(id).await?;
         if holding_id.is_none() {
             return Ok(None);
         }
-        sqlx::query(
-            "UPDATE holding_activities SET activity_type = ?, timestamp = ?, quantity = ?,
-                price_per_unit = ?, fee = ?, notes = ? WHERE id = ?",
-        )
-        .bind(activity_type)
-        .bind(timestamp)
-        .bind(quantity)
-        .bind(price_per_unit)
-        .bind(fee)
-        .bind(notes)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE holding_activities SET activity_type = ?1, timestamp = ?2, quantity = ?3,
+                    price_per_unit = ?4, fee = ?5, notes = ?6 WHERE id = ?7",
+                params![activity_type, timestamp, quantity, price_per_unit, fee, notes, id],
+            )
+            .await?;
         Ok(holding_id)
+    }
+
+    /// The holding a given activity belongs to (None if the activity row is gone). Backs the
+    /// holdings route handlers so they never touch a raw connection.
+    pub async fn holding_id_for_activity(&self, activity_id: i64) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT holding_id FROM holding_activities WHERE id = ?1",
+                params![activity_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Earliest BUY/TRANSFER_IN activity timestamp across all holdings, or None if there are no
+    /// such activities. Used for "performance since I started investing".
+    pub async fn earliest_activity_ts(&self) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT MIN(timestamp) FROM holding_activities
+                 WHERE activity_type IN ('BUY','TRANSFER_IN')",
+                (),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<Option<i64>>(0)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Best-effort: stamp `last_synced_at = now` on every holding for a symbol (UI freshness).
+    pub async fn touch_holdings_synced_for_symbol(&self, symbol: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE holdings SET last_synced_at = strftime('%s','now') WHERE symbol = ?1",
+                params![symbol],
+            )
+            .await?;
+        Ok(())
     }
 
     /// Recompute a holding's `quantity` and `avg_cost_per_unit` from its activity log.
@@ -1807,34 +1978,33 @@ impl Db {
         } else {
             None
         };
-        sqlx::query(
-            "UPDATE holdings SET quantity = ?, avg_cost_per_unit = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(qty)
-        .bind(avg)
-        .bind(Utc::now().timestamp())
-        .bind(holding_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE holdings SET quantity = ?1, avg_cost_per_unit = ?2, updated_at = ?3
+                 WHERE id = ?4",
+                params![qty, avg, Utc::now().timestamp(), holding_id],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn latest_quote(&self, symbol: &str) -> Result<Option<LatestQuote>> {
-        Ok(sqlx::query_as::<_, LatestQuote>(
-            "SELECT * FROM latest_quotes WHERE symbol = ?",
-        )
-        .bind(symbol)
-        .fetch_optional(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM latest_quotes WHERE symbol = ?1",
+                params![symbol],
+            )
+            .await?;
+        map_opt(rows).await
     }
 
     pub async fn all_latest_quotes(&self) -> Result<Vec<LatestQuote>> {
-        Ok(sqlx::query_as::<_, LatestQuote>(
-            "SELECT * FROM latest_quotes ORDER BY symbol",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        let rows = self
+            .conn
+            .query("SELECT * FROM latest_quotes ORDER BY symbol", ())
+            .await?;
+        map_rows(rows).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1847,27 +2017,29 @@ impl Db {
         day_change_pct: Option<f64>,
         company_name: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO latest_quotes (symbol, price, currency, fetched_at,
-                previous_close, day_change_pct, company_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(symbol) DO UPDATE SET
-                price = excluded.price,
-                currency = excluded.currency,
-                fetched_at = excluded.fetched_at,
-                previous_close = excluded.previous_close,
-                day_change_pct = excluded.day_change_pct,
-                company_name = COALESCE(excluded.company_name, latest_quotes.company_name)",
-        )
-        .bind(symbol)
-        .bind(price)
-        .bind(currency)
-        .bind(Utc::now().timestamp())
-        .bind(previous_close)
-        .bind(day_change_pct)
-        .bind(company_name)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT INTO latest_quotes (symbol, price, currency, fetched_at,
+                    previous_close, day_change_pct, company_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(symbol) DO UPDATE SET
+                    price = excluded.price,
+                    currency = excluded.currency,
+                    fetched_at = excluded.fetched_at,
+                    previous_close = excluded.previous_close,
+                    day_change_pct = excluded.day_change_pct,
+                    company_name = COALESCE(excluded.company_name, latest_quotes.company_name)",
+                params![
+                    symbol,
+                    price,
+                    currency,
+                    Utc::now().timestamp(),
+                    previous_close,
+                    day_change_pct,
+                    company_name,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -1877,36 +2049,51 @@ impl Db {
         transaction_id: i64,
         paid_ts: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO bill_payments (bill_id, transaction_id) VALUES (?, ?)",
-        )
-        .bind(bill_id)
-        .bind(transaction_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO bill_payments (bill_id, transaction_id) VALUES (?1, ?2)",
+                params![bill_id, transaction_id],
+            )
+            .await?;
         // Record the payment and roll the projected next-due date forward one period past the
         // payment we just matched, so the bill keeps pointing at a future date instead of
         // freezing on a stale value (the reason "Bills ahead" was silently empty).
-        let freq: Option<String> =
-            sqlx::query_scalar("SELECT repeat_freq FROM bills WHERE id = ?")
-                .bind(bill_id)
-                .fetch_optional(&self.pool)
+        let freq: Option<String> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT repeat_freq FROM bills WHERE id = ?1",
+                    params![bill_id],
+                )
                 .await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<String>(0)?),
+                None => None,
+            }
+        };
         let next = freq
             .as_deref()
             .map(|f| advance_past(paid_ts, f, Utc::now().timestamp()));
-        sqlx::query(
-            "UPDATE bills SET last_paid_date = ?, next_expected_date = COALESCE(?, next_expected_date),
-                updated_at = ? WHERE id = ?",
-        )
-        .bind(paid_ts)
-        .bind(next)
-        .bind(Utc::now().timestamp())
-        .bind(bill_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE bills SET last_paid_date = ?1, next_expected_date = COALESCE(?2, next_expected_date),
+                    updated_at = ?3 WHERE id = ?4",
+                params![paid_ts, next, Utc::now().timestamp(), bill_id],
+            )
+            .await?;
         Ok(())
     }
+}
+
+/// Strip a leading `file:` or `sqlite:` scheme from a database URL down to an OS path.
+/// Handles `file:///abs`, `file:rel`, `sqlite://x`, `sqlite:x`. A bare path is returned as-is.
+fn strip_db_scheme(url: &str) -> String {
+    for prefix in ["file://", "sqlite://", "file:", "sqlite:"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    url.to_string()
 }
 
 /// Guard activity writes (REST and MCP both land here): known type, finite non-negative
@@ -2011,5 +2198,251 @@ fn period_range(period: &str, now_ts: i64) -> (i64, i64) {
                 - 1;
             (start, end)
         }
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    //! Independent financial-correctness net for the sqlx→libsql cutover: insert via the real Db
+    //! methods, read back via the real Db methods, assert field-by-field. Targets the three
+    //! flagged risk areas — encrypted BLOB columns, the Account dual-mapper (join-only columns),
+    //! and the dynamic transaction SQL bind order — plus bool-as-int and NULL handling.
+    use super::*;
+    use crate::crypto::Crypto;
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine;
+
+    async fn test_db() -> Db {
+        let crypto = Crypto::from_b64(&B64STD.encode([9u8; 32])).unwrap();
+        let database = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = database.connect().unwrap();
+        crate::migrate::run(&conn).await.unwrap();
+        Db {
+            conn: std::sync::Arc::new(conn),
+            crypto,
+        }
+    }
+
+    #[tokio::test]
+    async fn consent_blob_and_crypto_roundtrip() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent(
+                "barclays",
+                "creds-123",
+                Some("ob-barclays"),
+                Some("Barclays"),
+                "ACCESS-TOKEN-xyz",
+                "REFRESH-TOKEN-abc",
+                1_700_000_000,
+                Some(1_800_000_000),
+                "accounts balance",
+            )
+            .await
+            .unwrap();
+        assert_eq!(c.nickname, "barclays");
+        assert_eq!(c.credentials_id, "creds-123");
+        assert_eq!(c.provider_id.as_deref(), Some("ob-barclays"));
+        assert_eq!(c.provider_display_name.as_deref(), Some("Barclays"));
+        assert_eq!(c.expires_at, 1_700_000_000);
+        assert_eq!(c.consent_expires_at, Some(1_800_000_000));
+        assert_eq!(c.scopes, "accounts balance");
+        assert_eq!(c.enabled, 1);
+        // Encrypted BLOB columns are populated (the catastrophic-if-wrong path).
+        assert!(!c.access_token_enc.is_empty());
+        assert!(!c.access_token_nonce.is_empty());
+        assert!(!c.refresh_token_enc.is_empty());
+        assert!(!c.refresh_token_nonce.is_empty());
+        // And decrypt to the original plaintext, through every read path.
+        assert_eq!(db.decrypt_access_token(&c).unwrap(), "ACCESS-TOKEN-xyz");
+        assert_eq!(db.decrypt_refresh_token(&c).unwrap(), "REFRESH-TOKEN-abc");
+        let by_nick = db.get_consent_by_nickname("barclays").await.unwrap().unwrap();
+        assert_eq!(db.decrypt_access_token(&by_nick).unwrap(), "ACCESS-TOKEN-xyz");
+        let by_id = db.get_consent(c.id).await.unwrap().unwrap();
+        assert_eq!(db.decrypt_refresh_token(&by_id).unwrap(), "REFRESH-TOKEN-abc");
+    }
+
+    #[tokio::test]
+    async fn consent_null_optionals_map_to_none() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("monzo", "creds-9", None, None, "at", "rt", 123, None, "accounts")
+            .await
+            .unwrap();
+        assert_eq!(c.provider_id, None);
+        assert_eq!(c.provider_display_name, None);
+        assert_eq!(c.consent_expires_at, None);
+        assert_eq!(c.last_sync_at, None);
+        assert_eq!(c.last_sync_status, None);
+        assert_eq!(c.last_sync_error, None);
+    }
+
+    #[tokio::test]
+    async fn account_dual_mapper_base_vs_join() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("acct-bank", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a = db
+            .upsert_account(
+                c.id,
+                "tl-acc-1",
+                "transaction",
+                "Current Account",
+                Some("GB00BANK"),
+                Some("01-02-03"),
+                Some("12345678"),
+                None,
+                "GBP",
+            )
+            .await
+            .unwrap();
+        // Base SELECT: the join-only columns are ABSENT → must map to None (not error/panic).
+        let base = db.list_accounts_for_consent(c.id).await.unwrap();
+        assert_eq!(base.len(), 1);
+        let ba = &base[0];
+        assert_eq!(ba.truelayer_id, "tl-acc-1");
+        assert_eq!(ba.display_name, "Current Account");
+        assert_eq!(ba.iban.as_deref(), Some("GB00BANK"));
+        assert_eq!(ba.sort_code.as_deref(), Some("01-02-03"));
+        assert_eq!(ba.account_number.as_deref(), Some("12345678"));
+        assert_eq!(ba.card_last4, None);
+        assert_eq!(ba.enabled, 1);
+        assert_eq!(ba.consent_nickname, None, "base query must not populate join-only column");
+        assert_eq!(ba.pending_net_cents, None, "base query must not populate computed column");
+        // Join SELECT: the same columns are PRESENT and must populate.
+        let joined = db.list_all_enabled_accounts().await.unwrap();
+        assert_eq!(joined.len(), 1);
+        let ja = &joined[0];
+        assert_eq!(ja.id, a.id);
+        assert_eq!(ja.consent_nickname.as_deref(), Some("acct-bank"));
+        assert_eq!(ja.pending_net_cents, Some(0), "no pending txns => 0, not None");
+    }
+
+    #[tokio::test]
+    async fn transaction_fields_bools_and_nulls() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("txbank", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a = db
+            .upsert_account(c.id, "tl-acc", "transaction", "Acct", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        let id = db
+            .upsert_transaction(
+                a.id,
+                "txn-1",
+                1_650_000_000,
+                "SALARY",
+                250_000,
+                "GBP",
+                true,
+                false,
+                Some("ACME LTD"),
+                None,
+                Some("Acme Payroll"),
+                None,
+                Some("note"),
+                None,
+            )
+            .await
+            .unwrap();
+        let t = db.get_transaction(id).await.unwrap().unwrap();
+        assert_eq!(t.account_id, a.id);
+        assert_eq!(t.provider_txn_id, "txn-1");
+        assert_eq!(t.timestamp, 1_650_000_000);
+        assert_eq!(t.description, "SALARY");
+        assert_eq!(t.amount_cents, 250_000);
+        assert_eq!(t.is_credit, 1, "bool true stored/read as i64 1");
+        assert_eq!(t.is_pending, 0, "bool false stored/read as i64 0");
+        assert_eq!(t.merchant_name.as_deref(), Some("ACME LTD"));
+        assert_eq!(t.counterparty_iban, None, "NULL optional maps to None");
+        assert_eq!(t.counterparty_name.as_deref(), Some("Acme Payroll"));
+        assert_eq!(t.category_id, None);
+        assert_eq!(t.notes.as_deref(), Some("note"));
+        assert_eq!(t.raw_json, None);
+    }
+
+    #[tokio::test]
+    async fn list_transactions_dynamic_filters() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("fbank", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a1 = db
+            .upsert_account(c.id, "acc-1", "transaction", "A1", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        let a2 = db
+            .upsert_account(c.id, "acc-2", "transaction", "A2", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        // a1: debit COFFEE 500 @1000 ; credit TESCO REFUND 1500 @2000
+        db.upsert_transaction(a1.id, "d1", 1000, "COFFEE", 500, "GBP", false, false, None, None, None, None, None, None).await.unwrap();
+        db.upsert_transaction(a1.id, "c1", 2000, "TESCO REFUND", 1500, "GBP", true, false, Some("TESCO"), None, None, None, None, None).await.unwrap();
+        // a2: debit TESCO STORES 9999 @1500
+        db.upsert_transaction(a2.id, "d2", 1500, "TESCO STORES", 9999, "GBP", false, false, Some("TESCO"), None, None, None, None, None).await.unwrap();
+
+        let ids = |v: &[Transaction]| v.iter().map(|t| t.provider_txn_id.clone()).collect::<Vec<_>>();
+
+        // No filters: all three, newest first.
+        let all = db.list_transactions(None, None, None, None, None, None, None, None, 100, 0).await.unwrap();
+        assert_eq!(ids(&all), vec!["c1", "d2", "d1"], "ORDER BY timestamp DESC");
+
+        // Account filter.
+        let only_a1 = db.list_transactions(Some(&[a1.id]), None, None, None, None, None, None, None, 100, 0).await.unwrap();
+        assert_eq!(only_a1.len(), 2);
+        assert!(only_a1.iter().all(|t| t.account_id == a1.id));
+
+        // is_credit = true.
+        let credits = db.list_transactions(None, None, None, None, None, None, Some(true), None, 100, 0).await.unwrap();
+        assert_eq!(ids(&credits), vec!["c1"]);
+
+        // Time window [1200,1800] → only d2 @1500.
+        let windowed = db.list_transactions(None, None, Some(1200), Some(1800), None, None, None, None, 100, 0).await.unwrap();
+        assert_eq!(ids(&windowed), vec!["d2"]);
+
+        // Amount range [1000,5000] → only c1 (1500).
+        let amt = db.list_transactions(None, None, None, None, Some(1000), Some(5000), None, None, 100, 0).await.unwrap();
+        assert_eq!(ids(&amt), vec!["c1"]);
+
+        // LIKE "TESCO" matches description OR merchant → c1 + d2.
+        let tesco = db.list_transactions(None, None, None, None, None, None, None, Some("TESCO"), 100, 0).await.unwrap();
+        assert_eq!(tesco.len(), 2);
+
+        // Combined multi-filter (exercises bind ordering): a2 + debit + TESCO → d2 only.
+        let combo = db.list_transactions(Some(&[a2.id]), None, None, None, None, None, Some(false), Some("TESCO"), 100, 0).await.unwrap();
+        assert_eq!(ids(&combo), vec!["d2"]);
+
+        // count parity for the account filter.
+        assert_eq!(db.count_transactions_filtered(Some(&[a1.id]), None, None, None).await.unwrap(), 2);
+
+        // LIMIT/OFFSET: second-newest is d2.
+        let paged = db.list_transactions(None, None, None, None, None, None, None, None, 1, 1).await.unwrap();
+        assert_eq!(ids(&paged), vec!["d2"]);
+    }
+
+    #[tokio::test]
+    async fn pending_net_cents_computed() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("pbank", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a = db
+            .upsert_account(c.id, "acc", "transaction", "A", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        // pending credit +300, pending debit -100 → net +200; the settled txn is excluded.
+        db.upsert_transaction(a.id, "p1", 1000, "in", 300, "GBP", true, true, None, None, None, None, None, None).await.unwrap();
+        db.upsert_transaction(a.id, "p2", 1001, "out", 100, "GBP", false, true, None, None, None, None, None, None).await.unwrap();
+        db.upsert_transaction(a.id, "s1", 1002, "settled", 9999, "GBP", false, false, None, None, None, None, None, None).await.unwrap();
+        let joined = db.list_all_enabled_accounts().await.unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].pending_net_cents, Some(200));
     }
 }

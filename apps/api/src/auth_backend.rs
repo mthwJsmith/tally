@@ -8,7 +8,18 @@
 
 use crate::auth::{self, User};
 use crate::db::Db;
+use crate::models::FromLibsqlRow;
 use axum_login::{AuthUser, AuthnBackend, UserId};
+use libsql::params;
+
+/// axum-login requires the backend's associated `Error` to be `std::error::Error + Send + Sync +
+/// 'static`. `anyhow::Error` does NOT impl `std::error::Error`, so wrap it in a thiserror enum
+/// that does. All libsql/db failures funnel through `Db(anyhow::Error)`.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error(transparent)]
+    Db(#[from] anyhow::Error),
+}
 
 impl AuthUser for User {
     type Id = i64;
@@ -44,13 +55,22 @@ pub struct Credentials {
 impl AuthnBackend for Backend {
     type User = User;
     type Credentials = Credentials;
-    type Error = sqlx::Error;
+    type Error = AuthError;
 
     async fn authenticate(&self, creds: Credentials) -> Result<Option<User>, Self::Error> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = ?")
-            .bind(creds.username.trim())
-            .fetch_optional(&self.db.pool)
-            .await?;
+        let mut rows = self
+            .db
+            .conn
+            .query(
+                "SELECT * FROM users WHERE username = ?1",
+                params![creds.username.trim()],
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let user = match rows.next().await.map_err(anyhow::Error::from)? {
+            Some(row) => Some(User::from_row(&row)?),
+            None => None,
+        };
         // Burn the same Argon2 work whether or not the username exists so response
         // timing doesn't reveal which usernames are registered.
         match user {
@@ -63,10 +83,16 @@ impl AuthnBackend for Backend {
     }
 
     async fn get_user(&self, user_id: &UserId<Self>) -> Result<Option<User>, Self::Error> {
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
-            .bind(*user_id)
-            .fetch_optional(&self.db.pool)
+        let mut rows = self
+            .db
+            .conn
+            .query("SELECT * FROM users WHERE id = ?1", params![*user_id])
             .await
+            .map_err(anyhow::Error::from)?;
+        match rows.next().await.map_err(anyhow::Error::from)? {
+            Some(row) => Ok(Some(User::from_row(&row)?)),
+            None => Ok(None),
+        }
     }
 }
 

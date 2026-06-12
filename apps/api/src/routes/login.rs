@@ -65,11 +65,10 @@ pub struct SetupBody {
 }
 
 async fn load_user(state: &Arc<AppState>, id: i64) -> Result<auth::User, (StatusCode, String)> {
-    sqlx::query_as::<_, auth::User>("SELECT * FROM users WHERE id = ?")
-        .bind(id)
-        .fetch_one(&state.db.pool)
+    auth::find_user_by_id(&state.db, id)
         .await
-        .map_err(internal)
+        .map_err(internal)?
+        .ok_or((StatusCode::UNAUTHORIZED, "user not found".into()))
 }
 
 /// First-run admin registration. Refuses once any user exists.

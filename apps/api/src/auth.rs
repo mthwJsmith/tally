@@ -10,17 +10,18 @@
 //!   6. POST /auth/2fa/recovery with a one-use code → falls back through if TOTP lost.
 
 use crate::db::Db;
+use crate::models::{ColumnIndex, FromLibsqlRow};
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::{rand_core::OsRng, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Argon2, PasswordHash};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+use libsql::params;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde::Deserialize;
-use sqlx::FromRow;
 use totp_rs::{Algorithm, Secret, TOTP};
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct User {
     pub id: i64,
     pub username: String,
@@ -35,6 +36,28 @@ pub struct User {
     pub last_login_at: Option<i64>,
     /// Highest TOTP time-step already consumed — prevents replay within the validity window.
     pub last_totp_step: i64,
+}
+
+impl FromLibsqlRow for User {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        // Loaded via SELECT * — map strictly by column name. The BLOB columns are nullable
+        // encrypted secrets (Option<Vec<u8>>); they must round-trip, hence a manual mapper.
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: { let i = c.req("id")?; row.get(i)? },
+            username: { let i = c.req("username")?; row.get(i)? },
+            password_hash: { let i = c.req("password_hash")?; row.get(i)? },
+            totp_secret_enc: { let i = c.req("totp_secret_enc")?; row.get(i)? },
+            totp_secret_nonce: { let i = c.req("totp_secret_nonce")?; row.get(i)? },
+            totp_enrolled: { let i = c.req("totp_enrolled")?; row.get(i)? },
+            recovery_codes_enc: { let i = c.req("recovery_codes_enc")?; row.get(i)? },
+            recovery_codes_nonce: { let i = c.req("recovery_codes_nonce")?; row.get(i)? },
+            is_admin: { let i = c.req("is_admin")?; row.get(i)? },
+            created_at: { let i = c.req("created_at")?; row.get(i)? },
+            last_login_at: { let i = c.req("last_login_at")?; row.get(i)? },
+            last_totp_step: { let i = c.req("last_totp_step")?; row.get(i)? },
+        })
+    }
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
@@ -121,33 +144,47 @@ pub struct VerifyTotpInput {
 }
 
 pub async fn count_users(db: &Db) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-        .fetch_one(&db.pool)
-        .await?;
-    Ok(row.0)
+    let mut rows = db.conn.query("SELECT COUNT(*) FROM users", ()).await?;
+    let row = rows.next().await?.ok_or_else(|| anyhow!("count produced no row"))?;
+    Ok(row.get::<i64>(0)?)
 }
 
 pub async fn create_user(db: &Db, username: &str, password: &str) -> Result<i64> {
     let hash = hash_password(password)?;
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
-    )
-    .bind(username)
-    .bind(hash)
-    .bind(chrono::Utc::now().timestamp())
-    .fetch_one(&db.pool)
-    .await
-    .context("create user")?;
-    Ok(row.0)
+    let mut rows = db
+        .conn
+        .query(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?1, ?2, ?3) RETURNING id",
+            params![username, hash, chrono::Utc::now().timestamp()],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow!("create user RETURNING produced no row"))?;
+    Ok(row.get::<i64>(0)?)
+}
+
+pub async fn find_user_by_id(db: &Db, id: i64) -> Result<Option<User>> {
+    let mut rows = db
+        .conn
+        .query("SELECT * FROM users WHERE id = ?1", params![id])
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(User::from_row(&row)?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn find_user_by_username(db: &Db, username: &str) -> Result<Option<User>> {
-    Ok(sqlx::query_as::<_, User>(
-        "SELECT * FROM users WHERE username = ?",
-    )
-    .bind(username)
-    .fetch_optional(&db.pool)
-    .await?)
+    let mut rows = db
+        .conn
+        .query("SELECT * FROM users WHERE username = ?1", params![username])
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(User::from_row(&row)?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn save_totp_secret(
@@ -160,18 +197,14 @@ pub async fn save_totp_secret(
     let (s_nonce, s_ct) = db.crypto.encrypt(&secret_b64)?;
     let codes_json = serde_json::to_string(recovery_codes)?;
     let (c_nonce, c_ct) = db.crypto.encrypt(&codes_json)?;
-    sqlx::query(
-        "UPDATE users SET totp_secret_enc = ?, totp_secret_nonce = ?,
-            recovery_codes_enc = ?, recovery_codes_nonce = ?, totp_enrolled = 1
-         WHERE id = ?",
-    )
-    .bind(&s_ct)
-    .bind(&s_nonce)
-    .bind(&c_ct)
-    .bind(&c_nonce)
-    .bind(user_id)
-    .execute(&db.pool)
-    .await?;
+    db.conn
+        .execute(
+            "UPDATE users SET totp_secret_enc = ?1, totp_secret_nonce = ?2,
+                recovery_codes_enc = ?3, recovery_codes_nonce = ?4, totp_enrolled = 1
+             WHERE id = ?5",
+            params![s_ct, s_nonce, c_ct, c_nonce, user_id],
+        )
+        .await?;
     Ok(())
 }
 
@@ -202,14 +235,12 @@ pub async fn consume_recovery_code(db: &Db, user: &User, candidate: &str) -> Res
         // Re-encrypt + save remaining codes.
         let json = serde_json::to_string(&codes)?;
         let (nonce, ct) = db.crypto.encrypt(&json)?;
-        sqlx::query(
-            "UPDATE users SET recovery_codes_enc = ?, recovery_codes_nonce = ? WHERE id = ?",
-        )
-        .bind(&ct)
-        .bind(&nonce)
-        .bind(user.id)
-        .execute(&db.pool)
-        .await?;
+        db.conn
+            .execute(
+                "UPDATE users SET recovery_codes_enc = ?1, recovery_codes_nonce = ?2 WHERE id = ?3",
+                params![ct, nonce, user.id],
+            )
+            .await?;
         Ok(true)
     } else {
         Ok(false)
@@ -242,10 +273,11 @@ pub async fn verify_totp_fresh(db: &Db, user: &User, code: &str) -> Result<bool>
             if (cand as i64) <= user.last_totp_step {
                 return Ok(false); // already-used or older step → replay
             }
-            sqlx::query("UPDATE users SET last_totp_step = ? WHERE id = ?")
-                .bind(cand as i64)
-                .bind(user.id)
-                .execute(&db.pool)
+            db.conn
+                .execute(
+                    "UPDATE users SET last_totp_step = ?1 WHERE id = ?2",
+                    params![cand as i64, user.id],
+                )
                 .await?;
             return Ok(true);
         }
@@ -254,10 +286,11 @@ pub async fn verify_totp_fresh(db: &Db, user: &User, code: &str) -> Result<bool>
 }
 
 pub async fn touch_last_login(db: &Db, user_id: i64) -> Result<()> {
-    sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
-        .bind(chrono::Utc::now().timestamp())
-        .bind(user_id)
-        .execute(&db.pool)
+    db.conn
+        .execute(
+            "UPDATE users SET last_login_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().timestamp(), user_id],
+        )
         .await?;
     Ok(())
 }
@@ -270,24 +303,29 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as B64STD;
 
     async fn fetch_user(db: &Db, id: i64) -> User {
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
-            .bind(id)
-            .fetch_one(&db.pool)
+        let mut rows = db
+            .conn
+            .query("SELECT * FROM users WHERE id = ?1", params![id])
             .await
-            .unwrap()
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        User::from_row(&row).unwrap()
     }
 
-    /// In-memory DB with migrations applied. `max_connections(1)` keeps the single shared
+    /// In-memory libsql DB with migrations applied. A single connection keeps the shared
     /// `:memory:` database alive across queries.
     async fn test_db() -> Db {
         let crypto = Crypto::from_b64(&B64STD.encode([7u8; 32])).unwrap();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+        let database = libsql::Builder::new_local(":memory:")
+            .build()
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        Db { pool, crypto }
+        let conn = database.connect().unwrap();
+        crate::migrate::run(&conn).await.unwrap();
+        Db {
+            conn: std::sync::Arc::new(conn),
+            crypto,
+        }
     }
 
     #[test]

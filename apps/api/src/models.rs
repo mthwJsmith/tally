@@ -1,10 +1,78 @@
-//! Domain models. SQL-backed via sqlx::FromRow.
+//! Domain models. SQL-backed via the manual `FromLibsqlRow` mappers below.
+//!
+//! Each struct maps from a `libsql::Row` BY COLUMN NAME (not positional index). This is
+//! mandatory because some structs gain extra columns only in certain join queries (e.g.
+//! `Account::consent_nickname` / `pending_net_cents` appear only in `list_all_enabled_accounts`),
+//! and `User` is loaded via `SELECT *`. A positional mapper would misalign when an optional
+//! column is absent. The name resolver below is tolerant of absent columns: a missing column
+//! yields `None` rather than panicking.
 
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::FromRow;
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+/// Manual row → struct mapper for the libsql backend (replaces `sqlx::FromRow`).
+pub trait FromLibsqlRow: Sized {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self>;
+}
+
+/// Resolves column-name → positional index for a libsql Row once, so mappers can fetch by name
+/// and tolerate columns that are absent from a given SELECT.
+///
+/// Note: libsql's `FromValue` trait (the bound on `Row::get`) is sealed and not publicly
+/// nameable, so this helper deliberately deals only in indices — the actual `row.get::<T>(idx)`
+/// call lives at each field site (where the concrete `T` is monomorphised without naming the
+/// trait). Mappers use the `col!` / `col_opt!` macros below to keep that terse.
+pub struct ColumnIndex {
+    names: Vec<Option<String>>,
+}
+
+impl ColumnIndex {
+    pub fn new(row: &libsql::Row) -> Self {
+        let n = row.column_count();
+        let mut names = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            names.push(row.column_name(i).map(|s| s.to_string()));
+        }
+        Self { names }
+    }
+
+    /// Index of a column by name, or None if the SELECT didn't include it.
+    pub fn idx(&self, name: &str) -> Option<i32> {
+        self.names
+            .iter()
+            .position(|c| c.as_deref() == Some(name))
+            .map(|p| p as i32)
+    }
+
+    /// Index of a required column; errors if the SELECT omitted it.
+    pub fn req(&self, name: &str) -> anyhow::Result<i32> {
+        self.idx(name)
+            .ok_or_else(|| anyhow::anyhow!("column '{name}' missing from row"))
+    }
+}
+
+/// Fetch a required column by name and convert to the field's type.
+/// `$c` is a `ColumnIndex`, `$row` the `libsql::Row`.
+macro_rules! col {
+    ($c:expr, $row:expr, $name:literal) => {{
+        let i = $c.req($name)?;
+        $row.get(i)?
+    }};
+}
+
+/// Fetch a column that may be entirely ABSENT from the SELECT (=> None) or present-but-NULL
+/// (=> None). Used for `#[sqlx(default)]`-style join-only columns; the field type must be
+/// `Option<_>`.
+macro_rules! col_opt {
+    ($c:expr, $row:expr, $name:literal) => {{
+        match $c.idx($name) {
+            Some(i) => $row.get(i)?,
+            None => None,
+        }
+    }};
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Consent {
     pub id: i64,
     pub nickname: String,
@@ -30,6 +98,32 @@ pub struct Consent {
     pub enabled: i64,
 }
 
+impl FromLibsqlRow for Consent {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            nickname: col!(c, row, "nickname"),
+            credentials_id: col!(c, row, "credentials_id"),
+            provider_id: col!(c, row, "provider_id"),
+            provider_display_name: col!(c, row, "provider_display_name"),
+            access_token_enc: col!(c, row, "access_token_enc"),
+            access_token_nonce: col!(c, row, "access_token_nonce"),
+            refresh_token_enc: col!(c, row, "refresh_token_enc"),
+            refresh_token_nonce: col!(c, row, "refresh_token_nonce"),
+            expires_at: col!(c, row, "expires_at"),
+            consent_expires_at: col!(c, row, "consent_expires_at"),
+            scopes: col!(c, row, "scopes"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+            last_sync_at: col!(c, row, "last_sync_at"),
+            last_sync_status: col!(c, row, "last_sync_status"),
+            last_sync_error: col!(c, row, "last_sync_error"),
+            enabled: col!(c, row, "enabled"),
+        })
+    }
+}
+
 impl Consent {
     pub fn is_consent_expired(&self) -> bool {
         match self.consent_expires_at {
@@ -43,7 +137,7 @@ impl Consent {
     }
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Account {
     pub id: i64,
     pub consent_id: i64,
@@ -75,15 +169,52 @@ pub struct Account {
     pub balance_updated_at: Option<i64>,
     // Not a column on `accounts` — populated by joins that select `c.nickname AS consent_nickname`
     // (e.g. the accounts list) so the UI can label tiles with the user's chosen bank nickname.
-    #[sqlx(default)]
+    // Absent from every non-join SELECT → resolved via get_opt_absent (=> None when missing).
     pub consent_nickname: Option<String>,
     // Signed net of this account's PENDING transactions (credits +, debits −), so the UI can show
     // a "true spendable after pending" figure. Computed in list_all_enabled_accounts only.
-    #[sqlx(default)]
     pub pending_net_cents: Option<i64>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Account {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            consent_id: col!(c, row, "consent_id"),
+            truelayer_id: col!(c, row, "truelayer_id"),
+            kind: col!(c, row, "kind"),
+            display_name: col!(c, row, "display_name"),
+            iban: col!(c, row, "iban"),
+            sort_code: col!(c, row, "sort_code"),
+            account_number: col!(c, row, "account_number"),
+            card_last4: col!(c, row, "card_last4"),
+            currency: col!(c, row, "currency"),
+            firefly_account_id: col!(c, row, "firefly_account_id"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+            current_balance_cents: col!(c, row, "current_balance_cents"),
+            available_balance_cents: col!(c, row, "available_balance_cents"),
+            overdraft_cents: col!(c, row, "overdraft_cents"),
+            credit_limit_cents: col!(c, row, "credit_limit_cents"),
+            last_statement_balance_cents: col!(c, row, "last_statement_balance_cents"),
+            last_statement_date: col!(c, row, "last_statement_date"),
+            payment_due_cents: col!(c, row, "payment_due_cents"),
+            payment_due_date: col!(c, row, "payment_due_date"),
+            account_type: col!(c, row, "account_type"),
+            card_network: col!(c, row, "card_network"),
+            name_on_card: col!(c, row, "name_on_card"),
+            custom_display_name: col!(c, row, "custom_display_name"),
+            balance_updated_at: col!(c, row, "balance_updated_at"),
+            // Join-only columns: absent from most SELECTs → None.
+            consent_nickname: col_opt!(c, row, "consent_nickname"),
+            pending_net_cents: col_opt!(c, row, "pending_net_cents"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Reminder {
     pub id: i64,
     pub title: String,
@@ -101,7 +232,29 @@ pub struct Reminder {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Reminder {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            title: col!(c, row, "title"),
+            notes: col!(c, row, "notes"),
+            freq: col!(c, row, "freq"),
+            every_n: col!(c, row, "every_n"),
+            anchor_day: col!(c, row, "anchor_day"),
+            due_at: col!(c, row, "due_at"),
+            notify_before: col!(c, row, "notify_before"),
+            notify_enabled: col!(c, row, "notify_enabled"),
+            completed_at: col!(c, row, "completed_at"),
+            notified_at: col!(c, row, "notified_at"),
+            archived: col!(c, row, "archived"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RecurringEntry {
     pub id: i64,
     pub account_id: i64,
@@ -117,7 +270,27 @@ pub struct RecurringEntry {
     pub last_seen_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for RecurringEntry {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            account_id: col!(c, row, "account_id"),
+            truelayer_id: col!(c, row, "truelayer_id"),
+            kind: col!(c, row, "kind"),
+            name: col!(c, row, "name"),
+            amount: col!(c, row, "amount"),
+            currency: col!(c, row, "currency"),
+            frequency: col!(c, row, "frequency"),
+            next_payment_date: col!(c, row, "next_payment_date"),
+            status: col!(c, row, "status"),
+            firefly_bill_id: col!(c, row, "firefly_bill_id"),
+            last_seen_at: col!(c, row, "last_seen_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SyncLogEntry {
     pub id: i64,
     pub consent_id: Option<i64>,
@@ -131,9 +304,27 @@ pub struct SyncLogEntry {
     pub error_message: Option<String>,
 }
 
+impl FromLibsqlRow for SyncLogEntry {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            consent_id: col!(c, row, "consent_id"),
+            started_at: col!(c, row, "started_at"),
+            ended_at: col!(c, row, "ended_at"),
+            status: col!(c, row, "status"),
+            accounts_synced: col!(c, row, "accounts_synced"),
+            transactions_imported: col!(c, row, "transactions_imported"),
+            transactions_skipped: col!(c, row, "transactions_skipped"),
+            recurring_imported: col!(c, row, "recurring_imported"),
+            error_message: col!(c, row, "error_message"),
+        })
+    }
+}
+
 // ----- v2 models -----
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Transaction {
     pub id: i64,
     pub account_id: i64,
@@ -154,7 +345,32 @@ pub struct Transaction {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Transaction {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            account_id: col!(c, row, "account_id"),
+            provider_txn_id: col!(c, row, "provider_txn_id"),
+            timestamp: col!(c, row, "timestamp"),
+            description: col!(c, row, "description"),
+            amount_cents: col!(c, row, "amount_cents"),
+            currency: col!(c, row, "currency"),
+            is_credit: col!(c, row, "is_credit"),
+            is_pending: col!(c, row, "is_pending"),
+            merchant_name: col!(c, row, "merchant_name"),
+            counterparty_iban: col!(c, row, "counterparty_iban"),
+            counterparty_name: col!(c, row, "counterparty_name"),
+            category_id: col!(c, row, "category_id"),
+            notes: col!(c, row, "notes"),
+            raw_json: col!(c, row, "raw_json"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Category {
     pub id: i64,
     pub name: String,
@@ -164,14 +380,39 @@ pub struct Category {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Category {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            parent_id: col!(c, row, "parent_id"),
+            icon: col!(c, row, "icon"),
+            colour: col!(c, row, "colour"),
+            created_at: col!(c, row, "created_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Tag {
     pub id: i64,
     pub name: String,
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Tag {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            created_at: col!(c, row, "created_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Rule {
     pub id: i64,
     pub name: String,
@@ -192,7 +433,32 @@ pub struct Rule {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Rule {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            enabled: col!(c, row, "enabled"),
+            priority: col!(c, row, "priority"),
+            match_description_regex: col!(c, row, "match_description_regex"),
+            match_merchant_regex: col!(c, row, "match_merchant_regex"),
+            match_min_amount_cents: col!(c, row, "match_min_amount_cents"),
+            match_max_amount_cents: col!(c, row, "match_max_amount_cents"),
+            match_account_id: col!(c, row, "match_account_id"),
+            match_is_credit: col!(c, row, "match_is_credit"),
+            set_category_id: col!(c, row, "set_category_id"),
+            add_tag_ids: col!(c, row, "add_tag_ids"),
+            set_notes: col!(c, row, "set_notes"),
+            times_applied: col!(c, row, "times_applied"),
+            last_applied_at: col!(c, row, "last_applied_at"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Budget {
     pub id: i64,
     pub name: String,
@@ -206,7 +472,25 @@ pub struct Budget {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Budget {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            category_id: col!(c, row, "category_id"),
+            amount_cents: col!(c, row, "amount_cents"),
+            period: col!(c, row, "period"),
+            currency: col!(c, row, "currency"),
+            rollover: col!(c, row, "rollover"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Broker {
     pub id: i64,
     pub name: String,
@@ -217,7 +501,22 @@ pub struct Broker {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Broker {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            kind: col!(c, row, "kind"),
+            currency: col!(c, row, "currency"),
+            notes: col!(c, row, "notes"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Holding {
     pub id: i64,
     pub broker_id: i64,
@@ -233,7 +532,27 @@ pub struct Holding {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for Holding {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            broker_id: col!(c, row, "broker_id"),
+            symbol: col!(c, row, "symbol"),
+            asset_class: col!(c, row, "asset_class"),
+            quantity: col!(c, row, "quantity"),
+            avg_cost_per_unit: col!(c, row, "avg_cost_per_unit"),
+            currency: col!(c, row, "currency"),
+            name: col!(c, row, "name"),
+            last_synced_at: col!(c, row, "last_synced_at"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HoldingActivity {
     pub id: i64,
     pub holding_id: i64,
@@ -247,7 +566,25 @@ pub struct HoldingActivity {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for HoldingActivity {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            holding_id: col!(c, row, "holding_id"),
+            activity_type: col!(c, row, "activity_type"),
+            timestamp: col!(c, row, "timestamp"),
+            quantity: col!(c, row, "quantity"),
+            price_per_unit: col!(c, row, "price_per_unit"),
+            fee: col!(c, row, "fee"),
+            currency: col!(c, row, "currency"),
+            notes: col!(c, row, "notes"),
+            created_at: col!(c, row, "created_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LatestQuote {
     pub symbol: String,
     pub price: f64,
@@ -258,7 +595,22 @@ pub struct LatestQuote {
     pub company_name: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+impl FromLibsqlRow for LatestQuote {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            symbol: col!(c, row, "symbol"),
+            price: col!(c, row, "price"),
+            currency: col!(c, row, "currency"),
+            fetched_at: col!(c, row, "fetched_at"),
+            previous_close: col!(c, row, "previous_close"),
+            day_change_pct: col!(c, row, "day_change_pct"),
+            company_name: col!(c, row, "company_name"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Bill {
     pub id: i64,
     pub name: String,
@@ -273,6 +625,27 @@ pub struct Bill {
     pub source_recurring_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl FromLibsqlRow for Bill {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            expected_amount_min_cents: col!(c, row, "expected_amount_min_cents"),
+            expected_amount_max_cents: col!(c, row, "expected_amount_max_cents"),
+            currency: col!(c, row, "currency"),
+            repeat_freq: col!(c, row, "repeat_freq"),
+            next_expected_date: col!(c, row, "next_expected_date"),
+            last_paid_date: col!(c, row, "last_paid_date"),
+            match_description_regex: col!(c, row, "match_description_regex"),
+            enabled: col!(c, row, "enabled"),
+            source_recurring_id: col!(c, row, "source_recurring_id"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
 }
 
 // ----- TrueLayer DTOs -----

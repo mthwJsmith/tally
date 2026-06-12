@@ -13,17 +13,19 @@ tokio = { version = "1.40", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "fs", "set-header", "limit"] }
 tower-sessions = "0.14"
-tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
 axum-login = "0.18"
+# Custom libsql-backed session store (src/session_store.rs) needs the SessionStore trait's
+# #[async_trait]; tower-sessions does not re-export it.
+async-trait = "0.1"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
 
-# Database (pure-Rust SQLite, no CGO needed for ARM cross-compile)
-# Migration in progress: sqlx (legacy) and libsql (Turso, target) coexist during the
-# transition so the crate keeps compiling. sqlx will be trimmed once the swap is complete.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
-libsql = "0.9"
+# Database: libsql (Turso). Local-file by default (Raspberry Pi / offline); embedded
+# remote-replica or pure-remote when TALLY_DATABASE_URL is libsql://wss://https:// + an auth
+# token. `replication` brings new_remote_replica + serde; `remote` brings new_remote; `sync`
+# is pulled by default and harmless.
+libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "serde"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

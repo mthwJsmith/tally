@@ -329,13 +329,11 @@ pub async fn delete_activity(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     // Capture the holding_id before delete so we can recompute its derived totals.
-    let holding_id: Option<i64> = sqlx::query_scalar(
-        "SELECT holding_id FROM holding_activities WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&state.db.pool)
-    .await
-    .map_err(internal)?;
+    let holding_id: Option<i64> = state
+        .db
+        .holding_id_for_activity(id)
+        .await
+        .map_err(internal)?;
     state.db.delete_activity(id).await.map_err(internal)?;
     if let Some(hid) = holding_id {
         state
@@ -439,14 +437,7 @@ pub async fn portfolio_history(
 
     // If `since_buy`, override the range with the earliest activity timestamp.
     let range = if q.since_buy {
-        let earliest: Option<i64> = sqlx::query_scalar(
-            "SELECT MIN(timestamp) FROM holding_activities
-             WHERE activity_type IN ('BUY','TRANSFER_IN')",
-        )
-        .fetch_one(&state.db.pool)
-        .await
-        .ok()
-        .flatten();
+        let earliest: Option<i64> = state.db.earliest_activity_ts().await.ok().flatten();
         match earliest {
             Some(ts) => {
                 let days = ((chrono::Utc::now().timestamp() - ts) / 86_400).max(1);
@@ -555,12 +546,7 @@ pub async fn sync_quotes(
     // touch holdings so the UI shows when last we got a price
     for s in &symbols {
         // best-effort
-        let _ = sqlx::query(
-            "UPDATE holdings SET last_synced_at = strftime('%s','now') WHERE symbol = ?",
-        )
-        .bind(s)
-        .execute(&state.db.pool)
-        .await;
+        let _ = state.db.touch_holdings_synced_for_symbol(s).await;
     }
     Ok(Json(json!({
         "symbols": symbols.len(),

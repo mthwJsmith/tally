@@ -9,6 +9,7 @@ mod crypto;
 mod db;
 mod importer;
 mod middleware;
+mod migrate;
 mod models;
 mod notifier;
 mod oidc;
@@ -17,6 +18,7 @@ mod recurrence;
 mod routes;
 mod rules;
 mod scheduler;
+mod session_store;
 
 use crate::clients::truelayer::TrueLayerClient;
 use crate::crypto::Crypto;
@@ -32,7 +34,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, SessionManagerLayer};
-use tower_sessions_sqlx_store::SqliteStore;
+use crate::session_store::LibsqlSessionStore;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -77,7 +79,8 @@ async fn main() -> Result<()> {
     let db = Db::connect(&database_url, crypto).await?;
 
     // Session store + axum-login auth layer (replaces the hand-rolled `sessions` table).
-    let session_store = SqliteStore::new(db.pool.clone());
+    // Backed by the same libsql connection as the rest of the app.
+    let session_store = LibsqlSessionStore::new(db.conn.clone());
     session_store
         .migrate()
         .await
