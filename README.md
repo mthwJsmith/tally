@@ -4,6 +4,8 @@ Self-hosted personal finance for UK Open Banking. Rust (axum) backend, React fro
 Docker container, SQLite storage with secrets encrypted at rest. It includes an MCP server so AI
 assistants can read your finances in near real-time, and built-in 2FA.
 
+**[You can one-click deploy it for free to Google Cloud →](#deploy-to-google-cloud-run-one-click)**
+
 ## What it does
 
 - Syncs UK bank accounts through TrueLayer. Multi-bank with a single OAuth callback URL.
@@ -74,12 +76,12 @@ proxy (and the zero-trust layer above).
 
 ## Deploy to Google Cloud Run (one-click)
 
-[![Run on Google Cloud](https://deploy.cloud.run/button.svg)](https://deploy.cloud.run/?git_repo=https://github.com/mthwjsmith/tally.git)
+[![Run on Google Cloud](https://deploy.cloud.run/button.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_image=gcr.io/cloudrun/button&cloudshell_git_repo=https://github.com/mthwjsmith/tally.git)
 
 Builds and deploys tally to your own Google Cloud account. You will be prompted for a few values
 (defined in `app.json`):
 
-- `TALLY_MASTER_KEY` (required) — run `openssl rand -base64 32` and paste the result.
+- `TALLY_MASTER_KEY` (required) — a secure random value is generated for you; just accept it.
 - `TALLY_TRUELAYER_CLIENT_ID` / `_SECRET` (required) — your TrueLayer Live app credentials.
 - The rest have sensible defaults; reminders are off (a scale-to-zero host can't run them).
 

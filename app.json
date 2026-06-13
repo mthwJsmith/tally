@@ -3,7 +3,8 @@
   "description": "Self-hosted personal finance for UK Open Banking (TrueLayer) — one-click deploy to Google Cloud Run.",
   "env": {
     "TALLY_MASTER_KEY": {
-      "description": "32-byte base64 key that encrypts bank tokens at rest. Generate one and paste it here: openssl rand -base64 32",
+      "description": "Encrypts your bank tokens at rest. A secure random value is generated for you — just accept it. Keep it safe: changing it later makes already-saved data unreadable.",
+      "generator": "secret",
       "required": true,
       "order": 1
     },

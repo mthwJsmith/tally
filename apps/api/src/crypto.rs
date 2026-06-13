@@ -12,6 +12,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, ChaCha20Poly1305, Key, Nonce,
 };
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct Crypto {
@@ -20,23 +21,39 @@ pub struct Crypto {
 
 impl Crypto {
     pub fn from_env() -> Result<Self> {
-        let raw = std::env::var("TALLY_MASTER_KEY")
-            .context("TALLY_MASTER_KEY env var not set — generate with `openssl rand -base64 32`")?;
-        Self::from_b64(raw.trim())
+        let raw = std::env::var("TALLY_MASTER_KEY").context("TALLY_MASTER_KEY env var not set")?;
+        let raw = raw.trim();
+        // Preferred form: a 32-byte base64 key (`openssl rand -base64 32`), used VERBATIM so
+        // existing deployments stay byte-for-byte identical. Otherwise — a Cloud Run
+        // auto-generated secret, or any other string — derive a 32-byte key by hashing it, so a
+        // one-click deploy works without hand-generating a key. The input must be high-entropy:
+        // a guessable passphrase weakens the at-rest encryption, since the key is never stored
+        // and an attacker with the database would otherwise have to brute-force the input.
+        if let Ok(bytes) = B64.decode(raw) {
+            if bytes.len() == 32 {
+                return Self::from_key_bytes(&bytes);
+            }
+        }
+        Self::from_key_bytes(&Sha256::digest(raw.as_bytes()))
     }
 
-    /// Build from a base64-encoded 32-byte key. Used by `from_env` and by tests.
+    /// Build from a base64-encoded 32-byte key. Used by tests.
     pub fn from_b64(raw: &str) -> Result<Self> {
         let bytes = B64
             .decode(raw.trim())
             .context("TALLY_MASTER_KEY is not valid base64")?;
+        Self::from_key_bytes(&bytes)
+    }
+
+    /// Build the cipher from exactly 32 key bytes.
+    fn from_key_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
             return Err(anyhow!(
-                "TALLY_MASTER_KEY must decode to exactly 32 bytes (got {})",
+                "master key must be exactly 32 bytes (got {})",
                 bytes.len()
             ));
         }
-        let key = Key::from_slice(&bytes);
+        let key = Key::from_slice(bytes);
         Ok(Self {
             cipher: ChaCha20Poly1305::new(key),
         })
@@ -80,5 +97,29 @@ mod tests {
     #[test]
     fn rejects_wrong_key_length() {
         assert!(Crypto::from_b64(&B64.encode([0u8; 16])).is_err());
+    }
+
+    // One test (not two) so the TALLY_MASTER_KEY env mutations can't race each other.
+    #[test]
+    fn from_env_key_derivation() {
+        // 1) A Cloud Run auto-generated secret (not a 32-byte base64 key) still produces a
+        //    working cipher, and deriving it twice yields the SAME key — else data would become
+        //    undecryptable after a restart.
+        std::env::set_var("TALLY_MASTER_KEY", "cloud run generated secret! not base64");
+        let a = Crypto::from_env().unwrap();
+        let (nonce, ct) = a.encrypt("balance: 12345").unwrap();
+        let b = Crypto::from_env().unwrap();
+        assert_eq!(b.decrypt(&nonce, &ct).unwrap(), "balance: 12345");
+
+        // 2) Back-compat: a 32-byte base64 key is used VERBATIM (not hashed), so existing
+        //    encrypted data stays readable. from_env and from_b64 must agree on the key.
+        let b64 = B64.encode([7u8; 32]);
+        std::env::set_var("TALLY_MASTER_KEY", &b64);
+        let env = Crypto::from_env().unwrap();
+        let direct = Crypto::from_b64(&b64).unwrap();
+        let (n2, c2) = direct.encrypt("secret").unwrap();
+        assert_eq!(env.decrypt(&n2, &c2).unwrap(), "secret");
+
+        std::env::remove_var("TALLY_MASTER_KEY");
     }
 }
