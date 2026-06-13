@@ -19,53 +19,28 @@
       "order": 3
     },
     "TALLY_DATABASE_URL": {
-      "description": "Default file:/app/data/state.db is EPHEMERAL on Cloud Run — wiped on every cold start, fine for a quick test. For durable data, set a Turso URL like libsql://YOUR-DB.turso.io and fill TALLY_DATABASE_AUTH_TOKEN below.",
+      "description": "Default file:/app/data/state.db is EPHEMERAL on Cloud Run — wiped on every cold start, fine for a quick test. For durable data set a Turso URL (libsql://YOUR-DB.turso.io) here AND add TALLY_DATABASE_AUTH_TOKEN in the Cloud Run console afterwards.",
       "value": "file:/app/data/state.db",
       "required": false,
       "order": 4
-    },
-    "TALLY_DATABASE_AUTH_TOKEN": {
-      "description": "Turso database auth token. Only needed when TALLY_DATABASE_URL is a libsql:// URL.",
-      "required": false,
-      "order": 5
-    },
-    "TALLY_REDIRECT_URI_BASE": {
-      "description": "Public base URL TrueLayer redirects back to, e.g. https://YOUR-SERVICE.run.app/auth . You get the run.app URL only AFTER the first deploy — leave blank now, then set it (and add it to your TrueLayer app's redirect URIs) and redeploy before linking a bank.",
-      "required": false,
-      "order": 6
     },
     "TALLY_ENABLE_REMINDERS": {
       "description": "Background reminders + Telegram + periodic bank sync. Off for serverless (a scale-to-zero host can't run the background loop reliably).",
       "value": "false",
       "required": false,
-      "order": 7
+      "order": 5
     },
     "TALLY_SECURE_COOKIES": {
       "description": "Keep true — Cloud Run always serves HTTPS.",
       "value": "true",
       "required": false,
-      "order": 8
+      "order": 6
     },
     "TALLY_TRUST_PROXY": {
       "description": "Keep true — Cloud Run (and IAP) front the app, so rate-limit keys read X-Forwarded-For.",
       "value": "true",
       "required": false,
-      "order": 9
-    },
-    "TALLY_OIDC_ISSUER": {
-      "description": "Optional. Set (with the two below) only if you front /mcp with an OIDC provider to enable the AI/MCP connector. Leave blank and /mcp simply rejects everything.",
-      "required": false,
-      "order": 10
-    },
-    "TALLY_OIDC_AUDIENCE": {
-      "description": "Optional. OIDC audience for the /mcp connector.",
-      "required": false,
-      "order": 11
-    },
-    "TALLY_OIDC_JWKS_URL": {
-      "description": "Optional. OIDC JWKS URL for the /mcp connector.",
-      "required": false,
-      "order": 12
+      "order": 7
     }
   },
   "options": {
