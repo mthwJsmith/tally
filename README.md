@@ -78,34 +78,71 @@ proxy (and the zero-trust layer above).
 
 [![Run on Google Cloud](https://deploy.cloud.run/button.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_image=gcr.io/cloudrun/button&cloudshell_git_repo=https://github.com/mthwjsmith/tally.git)
 
-Builds and deploys tally to your own Google Cloud account. You will be prompted for a few values
-(defined in `app.json`):
+Builds and deploys tally to your own Google Cloud account, entirely in your browser — nothing to
+install.
 
-- `TALLY_MASTER_KEY` (required) — a secure random value is generated for you; just accept it.
-- `TALLY_TRUELAYER_CLIENT_ID` / `_SECRET` (required) — your TrueLayer Live app credentials.
-- **Everything else: just press Enter.** The two TrueLayer values are the only things you need to
-  type. Accept the default database (it's ephemeral — fine for a test), and leave the Turso token,
-  redirect URI, and OIDC fields blank for now. You can set them later for a persistent/real deploy.
+### What happens when you click it
 
-For a quick test you can stop there — it deploys, you log in, and click around (data resets on cold
-start). To make it durable and link real banks, see the persistence and redirect-URI notes below.
+1. It opens Google Cloud Shell and clones the repo. If it shows the **wrong Google account**, open
+   the link in an **Incognito window** and sign in with the right one (Google has no per-link account
+   switcher).
+2. **Pick a project** — use the arrow keys to choose one of your existing projects, then press Enter.
+   (Don't press Ctrl-C — that starts a slower new-project flow.) If it asks about **billing**, that's
+   a one-time card setup: Cloud Run's free tier still applies, so you won't be charged for tally.
+3. **Pick a region** — choose one near you, e.g. `europe-west2` (London).
+4. It then asks for each setting below.
 
-**Data persistence.** Cloud Run has no persistent disk, so the default `file:` database is wiped on
-every cold start — fine for a quick test (create a user, click around). For data that survives,
-create a free [Turso](https://turso.tech) database and set `TALLY_DATABASE_URL=libsql://YOUR-DB.turso.io`
-plus `TALLY_DATABASE_AUTH_TOKEN`.
+### What it asks you — when to just press Enter
 
-**After the first deploy.** Copy the `https://YOUR-SERVICE.run.app` URL, set `TALLY_REDIRECT_URI_BASE`
-to `<that URL>/auth`, add the same callback to your TrueLayer app's redirect URIs, and redeploy —
-needed before you can link a bank.
+You only need to **type** two things (your TrueLayer credentials). For everything else, **press Enter**
+to accept the default.
 
-**Add a zero-trust gate (recommended).** The button deploys the service publicly; tally's own Argon2 +
-TOTP login still protects it, but for a stronger gate enable Google **Identity-Aware Proxy** — a
-one-click toggle on the Cloud Run service (no load balancer, no extra cost) that puts a Google sign-in
-in front. The deploy button can't set IAP itself, so do it after: Cloud Run → your service →
-**Security** → enable **Identity-Aware Proxy**, then grant yourself the **IAP-secured Web App User**
-role. Note: IAP gates the human web UI but is not compatible with the headless `/mcp` AI connector —
-on an IAP deployment, leave `/mcp` disabled (unset `TALLY_OIDC_*`) or front it with Cloudflare Access.
+| Prompt | What to do |
+|--------|------------|
+| `TALLY_MASTER_KEY` | **Press Enter** — a secure key is generated for you automatically. |
+| `TALLY_TRUELAYER_CLIENT_ID` | **Type** your TrueLayer Live client id. |
+| `TALLY_TRUELAYER_CLIENT_SECRET` | **Type** your TrueLayer Live client secret. |
+| `TALLY_DATABASE_URL` | **Press Enter** for a throwaway test database — **or** paste a Turso URL to keep your data (most people want this; see below). |
+| `TALLY_ENABLE_REMINDERS` | **Press Enter** (stays off — a serverless host can't run the background loop). |
+| `TALLY_SECURE_COOKIES` | **Press Enter** (stays `true`). |
+| `TALLY_TRUST_PROXY` | **Press Enter** (stays `true`). |
+
+Then it builds (~5–10 min) and prints your `https://…run.app` URL. Open it, create your user, enrol 2FA.
+
+### Keep your data: a free Turso database (recommended for real use)
+
+The default database lives on Cloud Run's disk, which is **wiped every time the service goes idle and
+restarts** — fine to *try* tally, but you'd lose your account and bank links. To keep everything,
+point tally at a free [Turso](https://turso.tech) database (hosted SQLite — same engine tally already
+uses):
+
+1. Sign up at [turso.tech](https://turso.tech) — the free tier is plenty for one person.
+2. Create a database and copy its URL — it looks like `libsql://your-db-name.turso.io`.
+3. Create a database **auth token** and copy it.
+4. At the **`TALLY_DATABASE_URL`** prompt during deploy, paste the `libsql://…` URL (instead of
+   pressing Enter).
+5. After the deploy finishes, add the token: **Cloud Run → your service → Edit & deploy new revision →
+   Variables & Secrets → add `TALLY_DATABASE_AUTH_TOKEN` = your token → Deploy.**
+
+Now your data survives restarts.
+
+### Link a bank: set the redirect URL
+
+Before the "add bank" button works, TrueLayer needs to know where to send you back after login:
+
+1. Copy your `https://YOUR-SERVICE.run.app` URL.
+2. **Cloud Run → your service → Edit & deploy new revision → Variables → add
+   `TALLY_REDIRECT_URI_BASE` = `https://YOUR-SERVICE.run.app/auth` → Deploy.**
+3. In the TrueLayer console, add `https://YOUR-SERVICE.run.app/auth/callback` to your app's allowed
+   redirect URIs.
+
+### Lock it down with Identity-Aware Proxy (recommended)
+
+The button deploys the service publicly — tally's own Argon2 + 2FA login still gates it, but for a
+stronger Google-sign-in gate, enable **IAP**: one click, no load balancer, no extra cost. **Cloud Run
+→ your service → Security → enable Identity-Aware Proxy**, then grant yourself the **IAP-secured Web
+App User** role. (IAP gates the human web UI; it is *not* compatible with the headless `/mcp` AI
+connector — on an IAP deployment leave `/mcp` disabled, or front it with Cloudflare Access instead.)
 
 ## Configuration
 
