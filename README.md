@@ -83,7 +83,12 @@ Builds and deploys tally to your own Google Cloud account. You will be prompted 
 
 - `TALLY_MASTER_KEY` (required) — a secure random value is generated for you; just accept it.
 - `TALLY_TRUELAYER_CLIENT_ID` / `_SECRET` (required) — your TrueLayer Live app credentials.
-- The rest have sensible defaults; reminders are off (a scale-to-zero host can't run them).
+- **Everything else: just press Enter.** The two TrueLayer values are the only things you need to
+  type. Accept the default database (it's ephemeral — fine for a test), and leave the Turso token,
+  redirect URI, and OIDC fields blank for now. You can set them later for a persistent/real deploy.
+
+For a quick test you can stop there — it deploys, you log in, and click around (data resets on cold
+start). To make it durable and link real banks, see the persistence and redirect-URI notes below.
 
 **Data persistence.** Cloud Run has no persistent disk, so the default `file:` database is wiped on
 every cold start — fine for a quick test (create a user, click around). For data that survives,
