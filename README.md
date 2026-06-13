@@ -72,6 +72,34 @@ docker compose up -d --build
 The container binds to `127.0.0.1:3001` by default. For remote access, front it with a TLS reverse
 proxy (and the zero-trust layer above).
 
+## Deploy to Google Cloud Run (one-click)
+
+[![Run on Google Cloud](https://deploy.cloud.run/button.svg)](https://deploy.cloud.run/?git_repo=https://github.com/mthwjsmith/tally.git)
+
+Builds and deploys tally to your own Google Cloud account. You will be prompted for a few values
+(defined in `app.json`):
+
+- `TALLY_MASTER_KEY` (required) — run `openssl rand -base64 32` and paste the result.
+- `TALLY_TRUELAYER_CLIENT_ID` / `_SECRET` (required) — your TrueLayer Live app credentials.
+- The rest have sensible defaults; reminders are off (a scale-to-zero host can't run them).
+
+**Data persistence.** Cloud Run has no persistent disk, so the default `file:` database is wiped on
+every cold start — fine for a quick test (create a user, click around). For data that survives,
+create a free [Turso](https://turso.tech) database and set `TALLY_DATABASE_URL=libsql://YOUR-DB.turso.io`
+plus `TALLY_DATABASE_AUTH_TOKEN`.
+
+**After the first deploy.** Copy the `https://YOUR-SERVICE.run.app` URL, set `TALLY_REDIRECT_URI_BASE`
+to `<that URL>/auth`, add the same callback to your TrueLayer app's redirect URIs, and redeploy —
+needed before you can link a bank.
+
+**Add a zero-trust gate (recommended).** The button deploys the service publicly; tally's own Argon2 +
+TOTP login still protects it, but for a stronger gate enable Google **Identity-Aware Proxy** — a
+one-click toggle on the Cloud Run service (no load balancer, no extra cost) that puts a Google sign-in
+in front. The deploy button can't set IAP itself, so do it after: Cloud Run → your service →
+**Security** → enable **Identity-Aware Proxy**, then grant yourself the **IAP-secured Web App User**
+role. Note: IAP gates the human web UI but is not compatible with the headless `/mcp` AI connector —
+on an IAP deployment, leave `/mcp` disabled (unset `TALLY_OIDC_*`) or front it with Cloudflare Access.
+
 ## Configuration
 
 Full list is in `apps/api/.env.example`. The ones you usually need:
@@ -80,6 +108,8 @@ Full list is in `apps/api/.env.example`. The ones you usually need:
 |----------|---------|
 | `TALLY_MASTER_KEY` | 32-byte base64 key that encrypts tokens at rest (required) |
 | `TALLY_TRUELAYER_CLIENT_ID` / `_SECRET` | TrueLayer Live credentials (required) |
+| `TALLY_DATABASE_URL` | `file:/path/state.db` (default, local) or `libsql://…turso.io` for hosted Turso (then set `TALLY_DATABASE_AUTH_TOKEN`) |
+| `TALLY_ENABLE_REMINDERS` | `true` (default) runs reminders/Telegram/sync; set `false` on serverless |
 | `TALLY_REDIRECT_URI_BASE` | Public base URL TrueLayer redirects back to |
 | `TALLY_OIDC_ISSUER` / `TALLY_OIDC_AUDIENCE` | External OIDC provider for the MCP connector |
 | `TALLY_SECURE_COOKIES` | Set to `true` when served over HTTPS |

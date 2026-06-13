@@ -113,7 +113,18 @@ async fn main() -> Result<()> {
         oidc,
     });
 
-    let _sched = scheduler::start_scheduler(state.clone()).await?;
+    // Reminders/Telegram + periodic bank sync run on a background scheduler. Defaults ON
+    // (self-host / Pi). The easy serverless deploy sets TALLY_ENABLE_REMINDERS=false: on a
+    // scale-to-zero host the background loop can't run reliably anyway, so it is disabled.
+    let reminders_enabled = env::var("TALLY_ENABLE_REMINDERS")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    let _sched = if reminders_enabled {
+        Some(scheduler::start_scheduler(state.clone()).await?)
+    } else {
+        tracing::info!("scheduler disabled (TALLY_ENABLE_REMINDERS=false): reminders, Telegram, and periodic sync are off");
+        None
+    };
 
     let app = routes::router(state.clone())
         .layer(auth_layer)
