@@ -32,7 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Templates (compile-time HTML); rendered manually via Html(render()) — no axum-coupled crate.
-askama = "0.12"
+askama = "0.16"
 
 # Crypto for token-at-rest encryption
 chacha20poly1305 = "0.10"
