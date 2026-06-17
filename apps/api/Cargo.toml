@@ -11,7 +11,7 @@ repository = "https://github.com/mthwjsmith/tally"
 axum = { version = "0.8", features = ["macros", "tokio"] }
 tokio = { version = "1.40", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "fs", "set-header", "limit"] }
+tower-http = { version = "0.7", features = ["trace", "fs", "set-header", "limit"] }
 tower-sessions = "0.14"
 axum-login = "0.18"
 # Custom libsql-backed session store (src/session_store.rs) needs the SessionStore trait's
