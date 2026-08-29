@@ -54,6 +54,16 @@ impl Claims {
     }
 }
 
+/// Single-user self-host escape hatch shared by `/mcp` and the REST middleware: when the owner
+/// sets TALLY_MCP_WRITE truthy, any token that PASSES full OIDC validation (i.e. is the owner)
+/// may write without the IdP minting a separate `write` scope. Default (unset) keeps the strict
+/// scope gate. Validation itself is never bypassed.
+pub fn write_allowed_by_env() -> bool {
+    std::env::var("TALLY_MCP_WRITE")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 struct CachedJwks {
     set: JwkSet,
     fetched: Instant,
@@ -118,6 +128,9 @@ pub async fn validate(cfg: &OidcConfig, token: &str) -> Option<Claims> {
     validation.algorithms = algorithms;
     validation.set_issuer(&[cfg.issuer.as_str()]);
     validation.set_audience(&[cfg.audience.as_str()]);
+    // set_issuer/set_audience only check the claims when present; require them so a token
+    // that simply omits aud/iss can't skate past the checks.
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     let data = decode::<Claims>(token, &key, &validation).ok()?;
     Some(data.claims)
 }

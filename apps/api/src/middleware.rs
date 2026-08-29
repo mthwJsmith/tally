@@ -8,7 +8,7 @@ use crate::auth_backend::AuthSession;
 use crate::oidc;
 use crate::AppState;
 use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use std::sync::Arc;
@@ -31,8 +31,16 @@ pub async fn require_auth(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
         {
-            if oidc::validate(cfg, raw.trim()).await.is_some() {
-                return Ok(next.run(req).await);
+            if let Some(claims) = oidc::validate(cfg, raw.trim()).await {
+                // Same scope model as /mcp: any valid token may read, but mutating requests
+                // need the `write` scope (or the TALLY_MCP_WRITE self-host escape hatch).
+                // Without this a "read-only" token could bypass the MCP gate by calling the
+                // REST mutations directly.
+                let is_read = matches!(*req.method(), Method::GET | Method::HEAD);
+                if is_read || claims.has_scope("write") || oidc::write_allowed_by_env() {
+                    return Ok(next.run(req).await);
+                }
+                return Err((StatusCode::FORBIDDEN, "token lacks write scope"));
             }
         }
     }

@@ -30,9 +30,10 @@ dependencies (report those upstream, though we welcome a heads-up).
 
 tally is self-hosted; a secure deployment depends on the operator:
 
-- Put it behind a **TLS-terminating reverse proxy** and set `TALLY_SECURE_COOKIES=true`
-  and `TALLY_TRUST_PROXY=true` (the latter makes auth rate limiting key on the real client
-  IP from `X-Forwarded-For`; never set it without a proxy in front — the header is forgeable).
+- Put it behind a **TLS-terminating reverse proxy** and set `TALLY_TRUST_PROXY=true`
+  (it makes auth rate limiting key on the real client IP from `X-Forwarded-For`; never set
+  it without a proxy in front — the header is forgeable). Session cookies are HTTPS-only by
+  default; only set `TALLY_SECURE_COOKIES=false` for plain-HTTP access (e.g. a raw LAN IP).
 - For internet exposure, front the web UI with a zero-trust layer (Cloudflare Access) or an
   **IdP / forward-auth** (Authentik, Authelia, Keycloak). See the README's security section.
 - Keep `TALLY_MASTER_KEY` and `.env` secret and backed up; never commit them.

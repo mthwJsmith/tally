@@ -30,6 +30,13 @@ pub async fn callback(
 ) -> impl IntoResponse {
     if let Some(err) = params.error {
         tracing::warn!("OAuth callback error: {err} - {:?}", params.error_description);
+        // The value is attacker-controlled; strip it to a safe charset (and cap the length)
+        // so it can't smuggle header-invalid bytes into Redirect::to, which panics on them.
+        let err: String = err
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(64)
+            .collect();
         return Redirect::to(&format!("/?error={err}"));
     }
     let Some(code) = params.code else {

@@ -143,7 +143,8 @@ impl Notifier {
         match self.http.post(&url).json(&body).send().await {
             Ok(r) if r.status().is_success() => debug!("telegram sent"),
             Ok(r) => warn!("telegram failed: {} {}", r.status(), r.text().await.unwrap_or_default()),
-            Err(e) => warn!("telegram error: {e:#}"),
+            // without_url: the request URL embeds the bot token, so it must never hit the logs.
+            Err(e) => warn!("telegram error: {:#}", e.without_url()),
         }
     }
 }
