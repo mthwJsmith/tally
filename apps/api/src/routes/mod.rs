@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod healthz;
 pub mod login;
 pub mod mcp;
+pub mod mcp_render;
 pub mod oauth;
 
 use crate::AppState;
@@ -51,6 +52,39 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/budgets", get(api::budgets::list).post(api::budgets::create))
         .route("/budgets/{id}", delete(api::budgets::delete))
         .route("/budgets/{id}/status", get(api::budgets::status))
+        .route("/safe-to-spend", get(api::safe_to_spend::get_status))
+        .route(
+            "/safe-to-spend/config",
+            get(api::safe_to_spend::get_config).put(api::safe_to_spend::put_config),
+        )
+        // Planning / "Ahead" forecast layer
+        .route("/ahead", get(api::ahead::get_ahead))
+        .route(
+            "/plan/accounts",
+            get(api::plan::list_accounts).post(api::plan::create_account),
+        )
+        .route("/plan/accounts/sync", post(api::plan::sync_accounts))
+        .route(
+            "/plan/actions",
+            get(api::plan::get_actions).put(api::plan::put_actions),
+        )
+        .route(
+            "/plan/accounts/{id}",
+            patch(api::plan::patch_account).delete(api::plan::delete_account),
+        )
+        .route(
+            "/plan/events",
+            get(api::plan::list_events).post(api::plan::create_event),
+        )
+        .route(
+            "/plan/events/{id}",
+            patch(api::plan::patch_event).delete(api::plan::delete_event),
+        )
+        .route("/goals", get(api::goals::list).post(api::goals::create))
+        .route(
+            "/goals/{id}",
+            patch(api::goals::patch).delete(api::goals::delete),
+        )
         .route("/bills", get(api::bills::list).post(api::bills::create))
         .route("/bills/upcoming", get(api::bills::upcoming))
         .route(
@@ -108,6 +142,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(api::holdings::portfolio_history),
         )
         .route("/holdings/net-worth", get(api::holdings::net_worth))
+        .route(
+            "/retirement",
+            get(api::retirement::get).put(api::retirement::put),
+        )
+        .route(
+            "/retirement/notes",
+            get(api::retirement::get_notes).put(api::retirement::put_notes),
+        )
+        .route(
+            "/net-worth/history",
+            get(api::retirement::net_worth_history),
+        )
         .route(
             "/holdings/{id}/activities",
             get(api::holdings::list_activities),

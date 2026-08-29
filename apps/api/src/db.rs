@@ -407,9 +407,11 @@ impl Db {
             .conn
             .query(
                 "SELECT a.*, c.nickname AS consent_nickname,
-                    (SELECT COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN t.amount_cents
+                    -- CAST to INTEGER so a stray REAL amount_cents can't make this aggregate a REAL
+                    -- (which would panic libsql's get::<i64> when mapping the Account row).
+                    CAST((SELECT COALESCE(SUM(CASE WHEN t.is_credit = 1 THEN t.amount_cents
                                               ELSE -t.amount_cents END), 0)
-                     FROM transactions t WHERE t.account_id = a.id AND t.is_pending = 1)
+                     FROM transactions t WHERE t.account_id = a.id AND t.is_pending = 1) AS INTEGER)
                         AS pending_net_cents
                  FROM accounts a
                  INNER JOIN consents c ON c.id = a.consent_id
@@ -1057,7 +1059,10 @@ impl Db {
         let mut rows = self
             .conn
             .query(
-                "SELECT category_id, SUM(amount_cents) AS total_cents
+                // CAST the aggregate to INTEGER: if any summed row stored amount_cents as a REAL
+                // (a non-lossless float under SQLite's INTEGER affinity), a bare SUM returns a REAL
+                // and libsql's `get::<i64>` panics with "invalid value type". CAST forces an Integer.
+                "SELECT category_id, CAST(COALESCE(SUM(amount_cents), 0) AS INTEGER) AS total_cents
                  FROM transactions
                  WHERE timestamp >= ?1 AND timestamp <= ?2 AND is_credit = 0
                  GROUP BY category_id",
@@ -1337,7 +1342,8 @@ impl Db {
         let mut rows = self
             .conn
             .query(
-                "SELECT SUM(amount_cents) FROM transactions
+                // CAST to INTEGER so a stray REAL amount_cents can't panic libsql's get on the SUM.
+                "SELECT CAST(COALESCE(SUM(amount_cents), 0) AS INTEGER) FROM transactions
                  WHERE category_id IS ?1 AND is_credit = 0 AND timestamp >= ?2 AND timestamp <= ?3",
                 params![budget.category_id, from, to],
             )
@@ -1435,6 +1441,107 @@ impl Db {
 
     /// Update an existing bill's expected amount window + projected next date. Used on re-sync
     /// when we've inferred a fresher amount/date for a DD from transaction history.
+    /// One net-worth history row per day; latest write for a day wins.
+    pub async fn upsert_net_worth_snapshot(
+        &self,
+        day: &str,
+        t: &crate::networth::Totals,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO net_worth_history (day, cash_cents, debt_cents,
+                    investments_cents, pension_cents, net_cents, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(day) DO UPDATE SET
+                    cash_cents = excluded.cash_cents,
+                    debt_cents = excluded.debt_cents,
+                    investments_cents = excluded.investments_cents,
+                    pension_cents = excluded.pension_cents,
+                    net_cents = excluded.net_cents,
+                    created_at = excluded.created_at",
+                params![
+                    day,
+                    t.cash_cents,
+                    t.debt_cents,
+                    t.investments_cents,
+                    t.pension_cents,
+                    t.net_cents,
+                    Utc::now().timestamp(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Net-worth history rows (day ASC) for the last `days` days.
+    /// Returns (day, cash, debt, investments, pension, net) in cents.
+    pub async fn list_net_worth_history(
+        &self,
+        days: i64,
+    ) -> Result<Vec<(String, i64, i64, i64, i64, i64)>> {
+        let cutoff = (Utc::now().date_naive() - chrono::Duration::days(days)).to_string();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT day, cash_cents, debt_cents, investments_cents, pension_cents, net_cents
+                 FROM net_worth_history WHERE day >= ?1 ORDER BY day ASC",
+                params![cutoff],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((
+                row.get::<String>(0)?,
+                row.get::<i64>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<i64>(3)?,
+                row.get::<i64>(4)?,
+                row.get::<i64>(5)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Single-row JSON blob of retirement-forecast assumptions (see routes::api::retirement).
+    pub async fn get_retirement_plan_json(&self) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT plan_json FROM retirement_plan WHERE id = 1", ())
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => Some(row.get::<String>(0)?),
+            None => None,
+        })
+    }
+
+    pub async fn set_retirement_plan_json(&self, plan_json: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO retirement_plan (id, plan_json, updated_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET plan_json = excluded.plan_json,
+                    updated_at = excluded.updated_at",
+                params![plan_json, Utc::now().timestamp()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Advance a detected bill's next-due date without touching its expected amounts —
+    /// used when the mandate's amount is unknown so user-set amounts survive re-syncs.
+    pub async fn update_bill_next_date(
+        &self,
+        id: i64,
+        next_expected_date: Option<i64>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE bills SET next_expected_date = ?1, updated_at = ?2 WHERE id = ?3",
+                params![next_expected_date, Utc::now().timestamp(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn update_bill_schedule(
         &self,
         id: i64,
@@ -2085,6 +2192,416 @@ impl Db {
                     updated_at = ?3 WHERE id = ?4",
                 params![paid_ts, next, Utc::now().timestamp(), bill_id],
             )
+            .await?;
+        Ok(())
+    }
+
+    // ============================================================
+    // v3 — planning / "Ahead" layer
+    // ============================================================
+
+    /// All enabled planning accounts. For synced ones, `resolved_balance_cents` carries the LIVE
+    /// balance from `accounts`; for manual ones it equals the stored `balance_cents`. CAST guards
+    /// against a stray REAL balance panicking libsql's i64 mapping (same class as the SUM bug).
+    pub async fn list_plan_accounts(&self) -> Result<Vec<PlanAccount>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT p.*,
+                    CAST(CASE WHEN p.source = 'synced'
+                              THEN COALESCE(a.current_balance_cents, p.balance_cents)
+                              ELSE p.balance_cents END AS INTEGER) AS resolved_balance_cents
+                 FROM plan_accounts p
+                 LEFT JOIN accounts a ON a.id = p.linked_account_id
+                 WHERE p.enabled = 1
+                 ORDER BY p.sort_order, p.id",
+                (),
+            )
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn get_plan_account(&self, id: i64) -> Result<Option<PlanAccount>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM plan_accounts WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_plan_account(
+        &self,
+        name: &str,
+        kind: &str,
+        source: &str,
+        linked_account_id: Option<i64>,
+        balance_cents: i64,
+        currency: &str,
+        floor_cents: i64,
+        credit_limit_cents: Option<i64>,
+        apr_bps: Option<i64>,
+        statement_day: Option<i64>,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO plan_accounts (name, kind, source, linked_account_id, balance_cents,
+                    currency, floor_cents, credit_limit_cents, apr_bps, statement_day,
+                    balance_updated_at, sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?11, ?11)",
+                params![
+                    name, kind, source, linked_account_id, balance_cents, currency, floor_cents,
+                    credit_limit_cents, apr_bps, statement_day, now
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_plan_account(
+        &self,
+        id: i64,
+        name: &str,
+        kind: &str,
+        balance_cents: i64,
+        currency: &str,
+        floor_cents: i64,
+        cliff_date: Option<&str>,
+        cliff_new_floor_cents: Option<i64>,
+        credit_limit_cents: Option<i64>,
+        apr_bps: Option<i64>,
+        statement_day: Option<i64>,
+        payment_intent: Option<&str>,
+        sort_order: i64,
+        enabled: i64,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE plan_accounts SET name = ?2, kind = ?3, balance_cents = ?4, currency = ?5,
+                    floor_cents = ?6, cliff_date = ?7, cliff_new_floor_cents = ?8,
+                    credit_limit_cents = ?9, apr_bps = ?10, statement_day = ?11, payment_intent = ?12,
+                    sort_order = ?13, enabled = ?14, balance_updated_at = ?15, updated_at = ?15
+                 WHERE id = ?1",
+                params![
+                    id, name, kind, balance_cents, currency, floor_cents, cliff_date,
+                    cliff_new_floor_cents, credit_limit_cents, apr_bps, statement_day,
+                    payment_intent, sort_order, enabled, now
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Link (or clear, with None) the account that absorbs this account's below-floor shortfall.
+    pub async fn set_plan_account_overflow(&self, id: i64, overflow_account_id: Option<i64>) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE plan_accounts SET overflow_account_id = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, overflow_account_id, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_plan_account_balance(&self, id: i64, balance_cents: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE plan_accounts SET balance_cents = ?2, balance_updated_at = ?3, updated_at = ?3
+                 WHERE id = ?1",
+                params![id, balance_cents, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_plan_account(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM plan_accounts WHERE id = ?1", params![id])
+            .await?;
+        Ok(())
+    }
+
+    /// Create plan_accounts for any enabled synced account not yet linked, and refresh the cached
+    /// balance of those already linked. Idempotent — safe to call on every Ahead load.
+    pub async fn seed_plan_accounts_from_synced(&self) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO plan_accounts (name, kind, source, linked_account_id, balance_cents,
+                    currency, floor_cents, credit_limit_cents, balance_updated_at, sort_order,
+                    created_at, updated_at)
+                 SELECT COALESCE(a.custom_display_name, c.nickname, a.display_name),
+                        CASE WHEN a.kind = 'card' THEN 'credit' ELSE 'current' END,
+                        'synced', a.id,
+                        CAST(COALESCE(a.current_balance_cents, 0) AS INTEGER),
+                        a.currency, 0,
+                        CAST(a.credit_limit_cents AS INTEGER),
+                        ?1, a.id, ?1, ?1
+                 FROM accounts a
+                 INNER JOIN consents c ON c.id = a.consent_id
+                 WHERE a.enabled = 1 AND c.enabled = 1
+                   AND a.id NOT IN (SELECT linked_account_id FROM plan_accounts
+                                    WHERE linked_account_id IS NOT NULL)",
+                params![now],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE plan_accounts
+                 SET balance_cents = CAST(COALESCE(
+                        (SELECT a.current_balance_cents FROM accounts a
+                         WHERE a.id = plan_accounts.linked_account_id), 0) AS INTEGER),
+                     balance_updated_at = ?1
+                 WHERE source = 'synced' AND linked_account_id IS NOT NULL",
+                params![now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ---- balance snapshots: daily history for the Ahead graph ------------------------------
+
+    /// Write today's (sign-adjusted) balance for every enabled planning account. Called on each
+    /// bank sync so history accrues going forward — including manual accounts, which can't be
+    /// backfilled. Idempotent per day (latest write wins). Returns the number of accounts written.
+    pub async fn snapshot_all_plan_accounts(&self, day: &str) -> Result<usize> {
+        self.seed_plan_accounts_from_synced().await.ok();
+        let accounts = self.list_plan_accounts().await?;
+        let now = Utc::now().timestamp();
+        for a in &accounts {
+            self.conn
+                .execute(
+                    "INSERT INTO balance_snapshots (plan_account_id, day, balance_cents, created_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(plan_account_id, day) DO UPDATE SET balance_cents = excluded.balance_cents",
+                    params![a.id, day, a.forecast_balance(), now],
+                )
+                .await?;
+        }
+        Ok(accounts.len())
+    }
+
+    /// Reconstruct the last `days` days of daily closing balances for synced current/savings
+    /// accounts from stored transactions, and seed them as snapshots WITHOUT overwriting any real
+    /// snapshot already taken that day (gap-fill only). For each past day D the closing balance is
+    /// `current_balance − Σ(signed posted transactions after end of D)`. Credit cards are skipped
+    /// (statement/sign quirks make naive reconstruction misleading) — they accrue going forward.
+    /// Idempotent and safe to run on every startup.
+    pub async fn backfill_balance_snapshots(&self, days: i64) -> Result<usize> {
+        self.seed_plan_accounts_from_synced().await.ok();
+        let accounts = self.list_plan_accounts().await?;
+        let today = Utc::now().date_naive();
+        let now = Utc::now().timestamp();
+        let mut written = 0usize;
+        for a in &accounts {
+            if a.source != "synced" || a.kind == "credit" {
+                continue; // only synced non-credit accounts reconstruct faithfully
+            }
+            let Some(acct_id) = a.linked_account_id else { continue };
+            let cur = a.forecast_balance(); // == raw current balance for non-credit accounts
+            for n in 0..=days {
+                let Some(d) = today.checked_sub_signed(chrono::Duration::days(n)) else { continue };
+                let day_iso = d.format("%Y-%m-%d").to_string();
+                let eod = d.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp();
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT CAST(COALESCE(SUM(CASE WHEN is_credit = 1 THEN amount_cents ELSE -amount_cents END), 0) AS INTEGER)
+                         FROM transactions WHERE account_id = ?1 AND is_pending = 0 AND timestamp > ?2",
+                        params![acct_id, eod],
+                    )
+                    .await?;
+                let sum_after: i64 = match rows.next().await? {
+                    Some(r) => r.get::<i64>(0)?,
+                    None => 0,
+                };
+                self.conn
+                    .execute(
+                        "INSERT INTO balance_snapshots (plan_account_id, day, balance_cents, created_at)
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(plan_account_id, day) DO NOTHING",
+                        params![a.id, day_iso, cur - sum_after, now],
+                    )
+                    .await?;
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Daily balance snapshots on or after `from_day`, as (plan_account_id, day, balance_cents),
+    /// ordered by day then account — the past series the Ahead graph draws left of "today".
+    pub async fn list_balance_snapshots_since(&self, from_day: &str) -> Result<Vec<(i64, String, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT plan_account_id, day, CAST(balance_cents AS INTEGER)
+                 FROM balance_snapshots WHERE day >= ?1 ORDER BY day, plan_account_id",
+                params![from_day],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push((r.get::<i64>(0)?, r.get::<String>(1)?, r.get::<i64>(2)?));
+        }
+        Ok(out)
+    }
+
+    pub async fn list_plan_events(&self) -> Result<Vec<PlanEvent>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM plan_events WHERE enabled = 1 ORDER BY date", ())
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn get_plan_event(&self, id: i64) -> Result<Option<PlanEvent>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM plan_events WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_plan_event(
+        &self,
+        date: &str,
+        label: &str,
+        source: &str,
+        account_id: Option<i64>,
+        to_account_id: Option<i64>,
+        amount_cents: i64,
+        recurrence: &str,
+        recur_until: Option<&str>,
+        category_id: Option<i64>,
+        match_regex: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO plan_events (date, label, source, account_id, to_account_id,
+                    amount_cents, recurrence, recur_until, category_id, match_regex, note,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                params![
+                    date, label, source, account_id, to_account_id, amount_cents, recurrence,
+                    recur_until, category_id, match_regex, note, now
+                ],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_plan_event(
+        &self,
+        id: i64,
+        date: &str,
+        label: &str,
+        source: &str,
+        account_id: Option<i64>,
+        to_account_id: Option<i64>,
+        amount_cents: i64,
+        recurrence: &str,
+        recur_until: Option<&str>,
+        category_id: Option<i64>,
+        match_regex: Option<&str>,
+        note: Option<&str>,
+        enabled: i64,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE plan_events SET date = ?2, label = ?3, source = ?4, account_id = ?5,
+                    to_account_id = ?6, amount_cents = ?7, recurrence = ?8, recur_until = ?9,
+                    category_id = ?10, match_regex = ?11, note = ?12, enabled = ?13, updated_at = ?14
+                 WHERE id = ?1",
+                params![
+                    id, date, label, source, account_id, to_account_id, amount_cents, recurrence,
+                    recur_until, category_id, match_regex, note, enabled, now
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_plan_event(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM plan_events WHERE id = ?1", params![id])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_goals(&self) -> Result<Vec<Goal>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM goals WHERE enabled = 1 ORDER BY target_date, id", ())
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn get_goal(&self, id: i64) -> Result<Option<Goal>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM goals WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
+    }
+
+    pub async fn create_goal(
+        &self,
+        name: &str,
+        target_cents: i64,
+        saved_cents: i64,
+        source_account_id: Option<i64>,
+        target_date: Option<&str>,
+        monthly_cents: i64,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO goals (name, target_cents, saved_cents, source_account_id, target_date,
+                    monthly_cents, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![name, target_cents, saved_cents, source_account_id, target_date, monthly_cents, now],
+            )
+            .await?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_goal(
+        &self,
+        id: i64,
+        name: &str,
+        target_cents: i64,
+        saved_cents: i64,
+        source_account_id: Option<i64>,
+        target_date: Option<&str>,
+        monthly_cents: i64,
+        enabled: i64,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE goals SET name = ?2, target_cents = ?3, saved_cents = ?4,
+                    source_account_id = ?5, target_date = ?6, monthly_cents = ?7, enabled = ?8,
+                    updated_at = ?9 WHERE id = ?1",
+                params![id, name, target_cents, saved_cents, source_account_id, target_date, monthly_cents, enabled, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_goal(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM goals WHERE id = ?1", params![id])
             .await?;
         Ok(())
     }

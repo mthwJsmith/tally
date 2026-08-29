@@ -186,6 +186,13 @@ impl Importer {
             }
         }
 
+        // Snapshot every planning account's balance for today, so the Ahead graph accrues history
+        // going forward (manual accounts included, since they can't be backfilled). Best-effort.
+        let today_iso = Utc::now().format("%Y-%m-%d").to_string();
+        if let Err(e) = self.db.snapshot_all_plan_accounts(&today_iso).await {
+            warn!("balance snapshot failed: {e:#}");
+        }
+
         Ok(result)
     }
 
@@ -725,7 +732,14 @@ impl Importer {
         };
         match self.db.bill_id_for_recurring(recurring_id).await {
             Ok(Some(bid)) => {
-                if let Err(e) = self.db.update_bill_schedule(bid, min, max, next_ts).await {
+                // When the provider can't tell us the amount, only advance the schedule —
+                // never clobber an amount the user set by hand with 0/0.
+                let res = if amount_cents.is_some() {
+                    self.db.update_bill_schedule(bid, min, max, next_ts).await
+                } else {
+                    self.db.update_bill_next_date(bid, next_ts).await
+                };
+                if let Err(e) = res {
                     debug!("update bill {bid} for recurring {recurring_id} failed: {e:#}");
                 }
             }

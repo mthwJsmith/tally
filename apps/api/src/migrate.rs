@@ -30,6 +30,13 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 10, name: "reminders", sql: include_str!("../migrations/0010_reminders.sql") },
     Migration { version: 11, name: "watchlist", sql: include_str!("../migrations/0011_watchlist.sql") },
     Migration { version: 12, name: "drop_watchlist", sql: include_str!("../migrations/0012_drop_watchlist.sql") },
+    Migration { version: 13, name: "planning", sql: include_str!("../migrations/0013_planning.sql") },
+    Migration { version: 14, name: "balance_snapshots", sql: include_str!("../migrations/0014_balance_snapshots.sql") },
+    Migration { version: 15, name: "floor_overflow", sql: include_str!("../migrations/0015_floor_overflow.sql") },
+    Migration { version: 16, name: "mcp_views", sql: include_str!("../migrations/0016_mcp_views.sql") },
+    Migration { version: 17, name: "fx_holdings_view", sql: include_str!("../migrations/0017_fx_holdings_view.sql") },
+    Migration { version: 18, name: "retirement", sql: include_str!("../migrations/0018_retirement.sql") },
+    Migration { version: 19, name: "net_worth_history", sql: include_str!("../migrations/0019_net_worth_history.sql") },
 ];
 
 const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
@@ -124,10 +131,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_db_applies_all_twelve() {
+    async fn fresh_db_applies_all() {
         let conn = mem().await;
         run(&conn).await.unwrap();
-        assert_eq!(applied_versions(&conn).await, (1..=12).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
         // The real migration SQL produced real tables under libsql (dialect smoke check).
         assert!(app_table_count(&conn).await > 0);
     }
@@ -137,22 +144,46 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         run(&conn).await.unwrap(); // second run must be a no-op, not an error
-        assert_eq!(applied_versions(&conn).await, (1..=12).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn mcp_views_are_selectable() {
+        // Preparing a SELECT against each reporting view fails if any referenced column
+        // drifts from the real schema — cheap guard for the MCP `query` tool surface.
+        let conn = mem().await;
+        run(&conn).await.unwrap();
+        for v in [
+            "v_accounts", "v_transactions", "v_plan_accounts", "v_plan_events", "v_bills",
+            "v_goals", "v_holdings", "v_categories", "v_net_worth_history",
+        ] {
+            conn.query(&format!("SELECT * FROM {v} LIMIT 1"), ())
+                .await
+                .unwrap_or_else(|e| panic!("view {v} broken: {e}"));
+        }
+        // The MCP `query` tool wraps user SQL as `SELECT * FROM (<sql>) LIMIT n` — make sure
+        // the wrapper also accepts a WITH…SELECT inside the subquery.
+        conn.query(
+            "SELECT * FROM (WITH m AS (SELECT 1 AS x) SELECT * FROM m) LIMIT 201",
+            (),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn preseeded_ledger_runs_nothing() {
-        // Simulate the production Pi: ledger records 1..12 as applied (with a non-empty checksum
-        // that must never be read), but the tables do NOT exist. A version-presence runner must
-        // skip all 12; a checksum-reading runner would crash, and a re-running one would build
-        // tables. We assert no app table was created.
+        // Simulate the production Pi: ledger records every version as applied (with a non-empty
+        // checksum that must never be read), but the tables do NOT exist. A version-presence
+        // runner must skip them all; a checksum-reading runner would crash, and a re-running one
+        // would build tables. We assert no app table was created.
         let conn = mem().await;
         conn.execute_batch(LEDGER_DDL).await.unwrap();
-        for v in 1..=12i64 {
+        for m in MIGRATIONS {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES (?1, 'x', 1, ?2, 0)",
-                libsql::params![v, vec![0xde_u8, 0xad]],
+                libsql::params![m.version, vec![0xde_u8, 0xad]],
             )
             .await
             .unwrap();

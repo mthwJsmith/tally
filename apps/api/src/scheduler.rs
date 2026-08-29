@@ -47,6 +47,17 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
     })?;
     sched.add(bills_job).await?;
 
+    // Net worth: record the daily history row at 08:10 (after the morning quote refresh
+    // traffic; upsert-by-day so timing is not critical).
+    let state_clone = state.clone();
+    let networth_job = Job::new_async("0 10 8 * * *", move |_uuid, _l| {
+        let state = state_clone.clone();
+        Box::pin(async move {
+            crate::networth::record_daily_snapshot(state).await;
+        })
+    })?;
+    sched.add(networth_job).await?;
+
     // Bank consents: daily 08:20 check for links about to hit the PSD2 90-day wall. Re-linking
     // has to happen before they lapse — afterwards there is a gap in the transaction history
     // no sync can backfill.
@@ -58,6 +69,16 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
         })
     })?;
     sched.add(consent_expiry_job).await?;
+
+    // Safe-to-spend: daily morning Telegram ping at 07:00 (only once the user has configured it).
+    let state_clone = state.clone();
+    let sts_job = Job::new_async("0 0 7 * * *", move |_uuid, _l| {
+        let state = state_clone.clone();
+        Box::pin(async move {
+            notify_safe_to_spend(state).await;
+        })
+    })?;
+    sched.add(sts_job).await?;
 
     sched.start().await?;
     info!(cron = %cron_expr, "scheduler started");
@@ -128,6 +149,38 @@ pub async fn notify_due_bills(state: Arc<AppState>) {
         .notifier
         .send_telegram_text(&lines.join("\n"), false)
         .await;
+}
+
+/// Daily: a one-line "how much is safe to spend today" Telegram ping. Silent if not configured.
+pub async fn notify_safe_to_spend(state: Arc<AppState>) {
+    let snapshot = match crate::routes::api::safe_to_spend::compute(&state).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("notify_safe_to_spend: {e:#}");
+            return;
+        }
+    };
+    // Don't nag until the user has set payday/floors.
+    if !snapshot.get("configured").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return;
+    }
+    let cents = |k: &str| snapshot.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    let days = snapshot.get("daysLeft").and_then(|v| v.as_i64()).unwrap_or(0);
+    let money = |c: i64| {
+        format!(
+            "{}£{:.2}",
+            if c < 0 { "−" } else { "" },
+            (c.abs() as f64) / 100.0
+        )
+    };
+    let text = format!(
+        "☀️ *Safe to spend today:* {}\n{}/day · {} day{} to payday",
+        money(cents("safeTodayCents")),
+        money(cents("safePerDayCents")),
+        days,
+        if days == 1 { "" } else { "s" }
+    );
+    state.notifier.send_telegram_text(&text, false).await;
 }
 
 /// Days before a consent lapses that we nudge. Under PSD2 a bank consent lasts 90 days and

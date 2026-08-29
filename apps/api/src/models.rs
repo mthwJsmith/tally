@@ -648,6 +648,165 @@ impl FromLibsqlRow for Bill {
     }
 }
 
+// ----- v3 — planning / "Ahead" layer -----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanAccount {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub source: String,
+    pub linked_account_id: Option<i64>,
+    pub overflow_account_id: Option<i64>,
+    pub balance_cents: i64,
+    pub currency: String,
+    pub floor_cents: i64,
+    pub cliff_date: Option<String>,
+    pub cliff_new_floor_cents: Option<i64>,
+    pub credit_limit_cents: Option<i64>,
+    pub apr_bps: Option<i64>,
+    pub statement_day: Option<i64>,
+    pub payment_intent: Option<String>,
+    pub balance_updated_at: Option<i64>,
+    pub sort_order: i64,
+    pub enabled: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    // Join-only: the live balance for synced accounts (read from `accounts`), else balance_cents.
+    // Present only in list_plan_accounts; absent (=> None) elsewhere.
+    pub resolved_balance_cents: Option<i64>,
+}
+
+impl FromLibsqlRow for PlanAccount {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            kind: col!(c, row, "kind"),
+            source: col!(c, row, "source"),
+            linked_account_id: col!(c, row, "linked_account_id"),
+            overflow_account_id: col!(c, row, "overflow_account_id"),
+            balance_cents: col!(c, row, "balance_cents"),
+            currency: col!(c, row, "currency"),
+            floor_cents: col!(c, row, "floor_cents"),
+            cliff_date: col!(c, row, "cliff_date"),
+            cliff_new_floor_cents: col!(c, row, "cliff_new_floor_cents"),
+            credit_limit_cents: col!(c, row, "credit_limit_cents"),
+            apr_bps: col!(c, row, "apr_bps"),
+            statement_day: col!(c, row, "statement_day"),
+            payment_intent: col!(c, row, "payment_intent"),
+            balance_updated_at: col!(c, row, "balance_updated_at"),
+            sort_order: col!(c, row, "sort_order"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+            resolved_balance_cents: col_opt!(c, row, "resolved_balance_cents"),
+        })
+    }
+}
+
+impl PlanAccount {
+    /// The authoritative "now" balance: the live synced balance when present, else the stored one.
+    pub fn balance(&self) -> i64 {
+        self.resolved_balance_cents.unwrap_or(self.balance_cents)
+    }
+    /// Balance signed for the forecast. Synced credit cards report what you OWE as a POSITIVE
+    /// number (TrueLayer convention); flip it negative so a card debt reads like one and the
+    /// running balance / net total are correct. Manual cards are already stored negative.
+    pub fn forecast_balance(&self) -> i64 {
+        let b = self.balance();
+        if self.source == "synced" && self.kind == "credit" {
+            -b.abs()
+        } else {
+            b
+        }
+    }
+    /// Active floor on a given ISO date, applying the cliff if it has passed.
+    pub fn floor_on(&self, date_iso: &str) -> i64 {
+        match (&self.cliff_date, self.cliff_new_floor_cents) {
+            (Some(d), Some(nf)) if date_iso >= d.as_str() => nf,
+            _ => self.floor_cents,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEvent {
+    pub id: i64,
+    pub date: String,
+    pub label: String,
+    pub source: String,
+    pub account_id: Option<i64>,
+    pub to_account_id: Option<i64>,
+    pub amount_cents: i64,
+    pub recurrence: String,
+    pub recur_until: Option<String>,
+    pub category_id: Option<i64>,
+    pub match_regex: Option<String>,
+    pub matched_txn_id: Option<i64>,
+    pub note: Option<String>,
+    pub enabled: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for PlanEvent {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            date: col!(c, row, "date"),
+            label: col!(c, row, "label"),
+            source: col!(c, row, "source"),
+            account_id: col!(c, row, "account_id"),
+            to_account_id: col!(c, row, "to_account_id"),
+            amount_cents: col!(c, row, "amount_cents"),
+            recurrence: col!(c, row, "recurrence"),
+            recur_until: col!(c, row, "recur_until"),
+            category_id: col!(c, row, "category_id"),
+            match_regex: col!(c, row, "match_regex"),
+            matched_txn_id: col!(c, row, "matched_txn_id"),
+            note: col!(c, row, "note"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Goal {
+    pub id: i64,
+    pub name: String,
+    pub target_cents: i64,
+    pub saved_cents: i64,
+    pub source_account_id: Option<i64>,
+    pub target_date: Option<String>,
+    pub monthly_cents: i64,
+    pub enabled: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for Goal {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            target_cents: col!(c, row, "target_cents"),
+            saved_cents: col!(c, row, "saved_cents"),
+            source_account_id: col!(c, row, "source_account_id"),
+            target_date: col!(c, row, "target_date"),
+            monthly_cents: col!(c, row, "monthly_cents"),
+            enabled: col!(c, row, "enabled"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
 // ----- TrueLayer DTOs -----
 
 pub mod truelayer {

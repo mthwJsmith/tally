@@ -7,7 +7,9 @@ mod auth_backend;
 mod clients;
 mod crypto;
 mod db;
+mod fx;
 mod importer;
+mod networth;
 mod middleware;
 mod migrate;
 mod models;
@@ -85,9 +87,12 @@ async fn main() -> Result<()> {
         .migrate()
         .await
         .context("migrating session store")?;
+    // Secure-by-default: session cookies are HTTPS-only unless explicitly opted out with
+    // TALLY_SECURE_COOKIES=false (needed only for plain-HTTP access, e.g. raw LAN IP —
+    // browsers still accept Secure cookies on http://localhost).
     let secure_cookies = env::var("TALLY_SECURE_COOKIES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(secure_cookies)
         .with_same_site(SameSite::Strict)
@@ -112,6 +117,27 @@ async fn main() -> Result<()> {
         ai,
         oidc,
     });
+
+    // Backfill ~2 weeks of daily balance history from stored transactions so the Ahead graph can
+    // show where you came from (the pre-payday trough) immediately, for synced current/savings
+    // accounts. Idempotent gap-fill — runs off the request path so startup isn't blocked.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            match st.db.backfill_balance_snapshots(14).await {
+                Ok(n) => tracing::info!("balance snapshot backfill seeded {n} day-rows"),
+                Err(e) => tracing::warn!("balance snapshot backfill failed: {e:#}"),
+            }
+        });
+    }
+    // Record today's net-worth row at startup so restarts never leave a gap and the
+    // series starts the moment this build first boots (upsert by day — idempotent).
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            crate::networth::record_daily_snapshot(st).await;
+        });
+    }
 
     // Reminders/Telegram + periodic bank sync run on a background scheduler. Defaults ON
     // (self-host / Pi). The easy serverless deploy sets TALLY_ENABLE_REMINDERS=false: on a
@@ -151,7 +177,7 @@ async fn main() -> Result<()> {
                  connect-src 'self'; \
                  font-src 'self' data:; \
                  base-uri 'self'; \
-                 form-action 'self'; \
+                 form-action 'self' https://*.truelayer.com; \
                  frame-ancestors 'none'",
             ),
         ))

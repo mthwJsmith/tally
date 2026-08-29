@@ -4,6 +4,8 @@ import { api } from "@/lib/api";
 import { formatMoney, relativeTime } from "@/lib/format";
 import type { Consent } from "@/types/api";
 import { PortfolioChart } from "@/components/PortfolioChart";
+import { NetWorthCard } from "@/components/NetWorthCard";
+import { SafeToSpend } from "@/components/SafeToSpend";
 import {
   chartColors,
   chartAxisProps,
@@ -182,6 +184,9 @@ function Dashboard() {
 
       {/* Bento grid: 12 cols, varying spans */}
       <div className="grid grid-cols-12 auto-rows-[minmax(0,auto)] gap-4 fade-in-1">
+        {/* Safe to spend — forward-looking runway to payday, with a "can I afford this?" check */}
+        <SafeToSpend />
+
         {/* Portfolio value — tall hero tile */}
         <section className="card p-7 col-span-12 lg:col-span-5 row-span-2 flex flex-col">
           <div className="flex items-start justify-between mb-3">
@@ -217,6 +222,9 @@ function Dashboard() {
             <PortfolioChart showRangePicker={false} height={220} defaultRange="3mo" />
           </div>
         </section>
+
+        {/* Net worth tile */}
+        <NetWorthCard />
 
         {/* Spend tile */}
         <section className="card p-7 col-span-12 sm:col-span-6 lg:col-span-4">
