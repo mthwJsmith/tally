@@ -36,10 +36,16 @@ type EnrichedHolding = {
     name: string | null;
     last_synced_at: number | null;
   };
+  broker_name: string | null;
+  broker_kind: string;
   current_price: number | null;
+  quote_currency: string;
   market_value: number | null;
   cost_basis: number | null;
+  market_value_gbp: number | null;
+  cost_basis_gbp: number | null;
   gain: number | null;
+  gain_gbp: number | null;
   gain_pct: number | null;
   day_change_pct: number | null;
   company_name: string | null;
@@ -62,6 +68,8 @@ function InvestmentsPage() {
         holdings_market_value: number;
         holdings_cost_basis: number;
         holdings_unrealised_gain: number;
+        general: { market_value: number; cost_basis: number; unrealised_gain: number };
+        pension: { market_value: number; cost_basis: number; unrealised_gain: number };
       }>("/api/holdings/net-worth"),
   });
 
@@ -76,21 +84,15 @@ function InvestmentsPage() {
 
   const [showAddBroker, setShowAddBroker] = useState(false);
   const [showAddHolding, setShowAddHolding] = useState(false);
+  const [chartKind, setChartKind] = useState<"all" | "general" | "sipp">("all");
 
+  // Totals arrive from the backend already converted to GBP (FX + pence handled
+  // server-side), so they always render in pounds regardless of holding currencies.
   const market = netWorth.data?.holdings_market_value ?? 0;
   const cost = netWorth.data?.holdings_cost_basis ?? 0;
   const gain = netWorth.data?.holdings_unrealised_gain ?? 0;
   const gainPct = cost > 0 ? (gain / cost) * 100 : 0;
   const positive = gain >= 0;
-  // Pick the dominant currency from the holdings list so the totals don't render in £
-  // when everything is USD. If holdings span multiple currencies we fall back to "" and
-  // leave formatMoney to use its default — a multi-currency aggregate would need FX.
-  const dominantCurrency = (() => {
-    const list = holdings.data?.holdings ?? [];
-    if (list.length === 0) return undefined;
-    const ccys = new Set(list.map((x) => x.holding.currency));
-    return ccys.size === 1 ? list[0].holding.currency : undefined;
-  })();
 
   return (
     <div className="p-8 md:p-12 space-y-8 max-w-[1280px]">
@@ -123,15 +125,27 @@ function InvestmentsPage() {
               Market value
             </p>
             <p className="font-extrabold text-3xl mono tracking-tight">
-              {formatMoney(Math.round(market * 100), dominantCurrency)}
+              {formatMoney(Math.round(market * 100))}
             </p>
+            {(netWorth.data?.pension.market_value ?? 0) > 0 && (
+              <p className="text-xs text-mid mt-1">
+                Pension{" "}
+                {formatMoney(
+                  Math.round((netWorth.data?.pension.market_value ?? 0) * 100)
+                )}{" "}
+                · Investments{" "}
+                {formatMoney(
+                  Math.round((netWorth.data?.general.market_value ?? 0) * 100)
+                )}
+              </p>
+            )}
           </div>
           <div>
             <p className="text-[10px] uppercase tracking-widest text-mid mb-2">
               Cost basis
             </p>
             <p className="font-extrabold text-3xl mono tracking-tight text-mid">
-              {formatMoney(Math.round(cost * 100), dominantCurrency)}
+              {formatMoney(Math.round(cost * 100))}
             </p>
           </div>
           <div>
@@ -144,7 +158,7 @@ function InvestmentsPage() {
               }`}
             >
               {positive ? "+" : "−"}
-              {formatMoney(Math.round(Math.abs(gain) * 100), dominantCurrency)}
+              {formatMoney(Math.round(Math.abs(gain) * 100))}
               <span className="text-base font-normal ml-2">
                 ({positive ? "+" : "−"}
                 {Math.abs(gainPct).toFixed(2)}%)
@@ -160,11 +174,41 @@ function InvestmentsPage() {
           <h2 className="text-2xl">
             Portfolio <em>over time</em>
           </h2>
-          <p className="text-xs uppercase tracking-widest text-mid">
-            Yahoo Finance · daily close
-          </p>
+          <div className="flex items-baseline gap-4">
+            {(netWorth.data?.pension.market_value ?? 0) > 0 && (
+              <div className="inline-flex gap-1 bg-cream p-1 rounded-md">
+                {(
+                  [
+                    ["all", "All"],
+                    ["general", "Investments"],
+                    ["sipp", "Pension"],
+                  ] as const
+                ).map(([value, label]) => (
+                  <button
+                    key={value}
+                    onClick={() => setChartKind(value)}
+                    className={`text-xs px-3 py-1 rounded font-semibold ${
+                      chartKind === value
+                        ? "bg-ink text-cream"
+                        : "text-mid hover:text-ink"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            <p className="text-xs uppercase tracking-widest text-mid">
+              Yahoo Finance · daily close
+            </p>
+          </div>
         </div>
-        <PortfolioChart showRangePicker height={320} />
+        <PortfolioChart
+          key={chartKind}
+          showRangePicker
+          height={320}
+          kind={chartKind === "all" ? undefined : chartKind}
+        />
       </section>
 
       {/* Brokers list */}
@@ -208,34 +252,68 @@ function InvestmentsPage() {
             onDone={() => setShowAddHolding(false)}
           />
         )}
-        <div className="card overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-cream">
-              <tr className="text-[11px] uppercase tracking-widest text-mid">
-                <th className="text-left px-4 py-2.5">Symbol</th>
-                <th className="text-left px-4 py-2.5">Quantity</th>
-                <th className="text-right px-4 py-2.5">Avg cost</th>
-                <th className="text-right px-4 py-2.5">Price</th>
-                <th className="text-right px-4 py-2.5">Value</th>
-                <th className="text-right px-4 py-2.5">P&L</th>
-                <th className="px-4 py-2.5"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {holdings.data?.holdings.map((h) => (
-                <HoldingRow key={h.holding.id} h={h} />
-              ))}
-              {!holdings.data?.holdings.length && (
-                <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-mid">
-                    No holdings yet. Add one above.
-                  </td>
-                </tr>
+        {(() => {
+          const all = holdings.data?.holdings ?? [];
+          const pension = all.filter((h) => h.broker_kind === "sipp");
+          const general = all.filter((h) => h.broker_kind !== "sipp");
+          // Pension only gets its own section once it exists; until then, one table.
+          const groups = pension.length
+            ? [
+                { label: "Investments", rows: general },
+                { label: "Pension (SIPP)", rows: pension },
+              ]
+            : [{ label: null, rows: all }];
+          return groups.map(({ label, rows }) => (
+            <div key={label ?? "all"} className="mb-4">
+              {label && (
+                <p className="text-[11px] uppercase tracking-widest text-mid font-semibold mb-2 mt-2">
+                  {label}
+                  <span className="ml-2 normal-case tracking-normal font-normal">
+                    {formatMoney(
+                      Math.round(
+                        rows.reduce((s, h) => s + (h.market_value_gbp ?? 0), 0) * 100
+                      )
+                    )}
+                  </span>
+                </p>
               )}
-            </tbody>
-          </table>
-        </div>
+              <HoldingsTable rows={rows} />
+            </div>
+          ));
+        })()}
       </section>
+    </div>
+  );
+}
+
+function HoldingsTable({ rows }: { rows: EnrichedHolding[] }) {
+  return (
+    <div className="card overflow-hidden">
+      <table className="w-full text-sm">
+        <thead className="bg-cream">
+          <tr className="text-[11px] uppercase tracking-widest text-mid">
+            <th className="text-left px-4 py-2.5">Symbol</th>
+            <th className="text-left px-4 py-2.5">Quantity</th>
+            <th className="text-right px-4 py-2.5">Avg cost</th>
+            <th className="text-right px-4 py-2.5">Price</th>
+            <th className="text-right px-4 py-2.5">Value</th>
+            <th className="text-right px-4 py-2.5">P&L</th>
+            <th className="px-4 py-2.5"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((h) => (
+            <HoldingRow key={h.holding.id} h={h} />
+          ))}
+          {!rows.length && (
+            <tr>
+              <td colSpan={7} className="px-4 py-8 text-center text-mid">
+                No holdings yet. Add one above.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -244,7 +322,13 @@ function BrokerCard({ broker }: { broker: Broker }) {
   const qc = useQueryClient();
   const del = useMutation({
     mutationFn: () => api.delete(`/api/brokers/${broker.id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["brokers"] }),
+    // Deleting a broker cascades to its holdings, so every derived view is stale.
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["brokers"] });
+      qc.invalidateQueries({ queryKey: ["holdings"] });
+      qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
+      qc.invalidateQueries({ queryKey: ["portfolio-history"] });
+    },
   });
   return (
     <div className="card p-4 flex items-center justify-between">
@@ -364,6 +448,7 @@ function AddActivityForm({ brokers, onDone }: { brokers: Broker[]; onDone: () =>
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["holdings"] });
       qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
+      qc.invalidateQueries({ queryKey: ["portfolio-history"] });
       onDone();
     },
   });
@@ -526,11 +611,15 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
   const navigate = useNavigate();
   const del = useMutation({
     mutationFn: () => api.delete(`/api/holdings/${h.holding.id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["holdings"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["holdings"] });
+      qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
+      qc.invalidateQueries({ queryKey: ["portfolio-history"] });
+    },
   });
   const open = () =>
     navigate({ to: "/investments/$id", params: { id: h.holding.id.toString() } });
-  const positive = (h.gain ?? 0) >= 0;
+  const positive = (h.gain_gbp ?? 0) >= 0;
   return (
     <tr
       className="border-t border-thin hover:bg-cream/60 cursor-pointer"
@@ -549,7 +638,11 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
           : "—"}
       </td>
       <td className="px-4 py-3 mono text-right">
-        {h.current_price != null ? h.current_price.toFixed(2) : "—"}
+        {h.current_price != null
+          ? h.quote_currency !== "GBP"
+            ? `${h.current_price.toFixed(2)} ${h.quote_currency}`
+            : h.current_price.toFixed(2)
+          : "—"}
         {h.day_change_pct != null && (
           <span
             className={`block text-[10px] mt-0.5 ${
@@ -562,12 +655,18 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
         )}
       </td>
       <td className="px-4 py-3 mono text-right">
-        {h.market_value != null
-          ? formatMoney(Math.round(h.market_value * 100), h.holding.currency)
+        {h.market_value_gbp != null
+          ? formatMoney(Math.round(h.market_value_gbp * 100))
           : "—"}
+        {/* Native-currency value for cross-checking against the broker app. */}
+        {h.market_value != null && h.quote_currency !== "GBP" && (
+          <span className="block text-[10px] text-mid mt-0.5">
+            {formatMoney(Math.round(h.market_value * 100), h.quote_currency)}
+          </span>
+        )}
       </td>
       <td className="px-4 py-3 mono text-right">
-        {h.gain != null ? (
+        {h.gain_gbp != null ? (
           <span
             className={`inline-flex items-center gap-1 ${
               positive ? "text-green" : "text-danger"
@@ -579,10 +678,7 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
               <TrendingDown className="size-3" />
             )}
             {positive ? "+" : "−"}
-            {formatMoney(
-              Math.round(Math.abs(h.gain) * 100),
-              h.holding.currency
-            )}
+            {formatMoney(Math.round(Math.abs(h.gain_gbp) * 100))}
             {h.gain_pct != null && (
               <span className="text-[10px] text-mid">
                 ({h.gain_pct.toFixed(1)}%)

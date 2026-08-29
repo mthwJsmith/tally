@@ -19,6 +19,16 @@ pub struct YahooClient {
     http: Client,
 }
 
+/// Yahoo quotes LSE-listed instruments (VUAG.L, most 0P… funds) in pence sterling,
+/// reported as currency "GBp" (sometimes "GBX"). Normalise to pounds at the edge so
+/// everything downstream deals in major units only.
+fn normalize_ccy(price: f64, currency: &str) -> (f64, String) {
+    match currency {
+        "GBp" | "GBX" | "gbp_pence" => (price / 100.0, "GBP".to_string()),
+        other => (price, other.to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Quote {
     pub symbol: String,
@@ -113,10 +123,16 @@ impl YahooClient {
             .get("regularMarketPrice")
             .and_then(|x| x.as_f64());
         let Some(price) = price else { return Ok(None) };
+        let raw_ccy = meta
+            .get("currency")
+            .and_then(|x| x.as_str())
+            .unwrap_or("USD");
+        let (price, currency) = normalize_ccy(price, raw_ccy);
         let prev = meta
             .get("chartPreviousClose")
             .or_else(|| meta.get("previousClose"))
-            .and_then(|x| x.as_f64());
+            .and_then(|x| x.as_f64())
+            .map(|p| normalize_ccy(p, raw_ccy).0);
         let day_pct = match prev {
             Some(p) if p > 0.0 => Some(((price - p) / p) * 100.0),
             _ => None,
@@ -124,11 +140,7 @@ impl YahooClient {
         Ok(Some(Quote {
             symbol: symbol.to_string(),
             price,
-            currency: meta
-                .get("currency")
-                .and_then(|x| x.as_str())
-                .unwrap_or("USD")
-                .to_string(),
+            currency,
             name: meta
                 .get("longName")
                 .or_else(|| meta.get("shortName"))
@@ -172,6 +184,12 @@ impl YahooClient {
         let Some(result) = parsed.chart.result.into_iter().next() else {
             return Ok(vec![]);
         };
+        // Pence-quoted series (GBp) are normalised to pounds, same as spot quotes.
+        let raw_ccy = result
+            .meta
+            .as_ref()
+            .and_then(|m| m.currency.as_deref())
+            .unwrap_or("USD");
         let timestamps = result.timestamp.unwrap_or_default();
         let closes = result
             .indicators
@@ -185,7 +203,7 @@ impl YahooClient {
             if let Some(Some(c)) = closes.get(i) {
                 out.push(HistoryPoint {
                     timestamp: ts,
-                    close: *c,
+                    close: normalize_ccy(*c, raw_ccy).0,
                 });
             }
         }
@@ -245,8 +263,16 @@ struct ChartInner {
 #[derive(Debug, Deserialize)]
 struct ChartResult {
     #[serde(default)]
+    meta: Option<ChartMeta>,
+    #[serde(default)]
     timestamp: Option<Vec<i64>>,
     indicators: ChartIndicators,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartMeta {
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +299,19 @@ pub struct SymbolHit {
 struct SearchResponse {
     #[serde(default)]
     quotes: Vec<SearchHit>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_ccy;
+
+    #[test]
+    fn pence_quotes_become_pounds() {
+        assert_eq!(normalize_ccy(10732.0, "GBp"), (107.32, "GBP".to_string()));
+        assert_eq!(normalize_ccy(1530.0, "GBX"), (15.30, "GBP".to_string()));
+        assert_eq!(normalize_ccy(95.04, "USD"), (95.04, "USD".to_string()));
+        assert_eq!(normalize_ccy(107.32, "GBP"), (107.32, "GBP".to_string()));
+    }
 }
 
 #[derive(Debug, Deserialize)]

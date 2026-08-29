@@ -312,6 +312,8 @@ function ActivityRow({ a, holdingId }: { a: Activity; holdingId: number }) {
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["activities", holdingId] });
     qc.invalidateQueries({ queryKey: ["holdings"] });
+    qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
+    qc.invalidateQueries({ queryKey: ["portfolio-history"] });
   };
   const del = useMutation({
     mutationFn: () => api.delete(`/api/activities/${a.id}`),
@@ -503,6 +505,8 @@ function AddActivityForm({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["activities", holdingId] });
       qc.invalidateQueries({ queryKey: ["holdings"] });
+      qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
+      qc.invalidateQueries({ queryKey: ["portfolio-history"] });
       setQty("");
       setPrice("");
       setFee("");

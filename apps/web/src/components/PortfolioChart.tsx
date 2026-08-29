@@ -56,19 +56,22 @@ interface Props {
   height?: number;
   /** Initial range. */
   defaultRange?: Range;
+  /** Filter by broker kind: "sipp" = pension only, "general" = non-pension. */
+  kind?: "sipp" | "general";
 }
 
 export function PortfolioChart({
   showRangePicker = true,
   height = 280,
   defaultRange = "since",
+  kind,
 }: Props) {
   const [range, setRange] = useState<Range>(defaultRange);
   const cfg = RANGES.find((r) => r.value === range) ?? RANGES[0];
   const intraday = range === "1d" || range === "5d";
   const sinceBuy = range === "since";
   const series = useQuery({
-    queryKey: ["portfolio-history", range],
+    queryKey: ["portfolio-history", range, kind ?? "all"],
     queryFn: () =>
       api.get<{
         points: { timestamp: number; value: number }[];
@@ -76,7 +79,7 @@ export function PortfolioChart({
       }>(
         `/api/holdings/portfolio-history?range=${range}&interval=${cfg.interval}${
           sinceBuy ? "&since_buy=true" : ""
-        }`,
+        }${kind ? `&kind=${kind}` : ""}`,
       ),
     staleTime: intraday ? 30_000 : 5 * 60_000,
     refetchInterval: cfg.refetchMs,
