@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   Wallet,
+  Link as LinkIcon,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { relativeTime } from "@/lib/format";
@@ -191,10 +192,17 @@ function BankCard({
   const [draft, setDraft] = useState(consent.nickname);
 
   const status = consent.last_sync_status;
+  // A lapsed consent is not a flaky sync — it can only be fixed by walking the OAuth flow
+  // again, so it gets its own pill and its own call to action.
+  const needsRelink = status === "reauth";
   const statusPill =
     status === "success" ? (
       <span className="pill-green inline-flex items-center gap-1">
         <CheckCircle2 className="size-3" /> healthy
+      </span>
+    ) : needsRelink ? (
+      <span className="pill-orange inline-flex items-center gap-1">
+        <LinkIcon className="size-3" /> re-link needed
       </span>
     ) : status === "fail" ? (
       <span className="pill-orange inline-flex items-center gap-1">
@@ -276,10 +284,32 @@ function BankCard({
         </ul>
       )}
 
-      {consent.last_sync_error && (
-        <p className="text-xs text-danger mono break-all">
-          {consent.last_sync_error}
-        </p>
+      {needsRelink ? (
+        <div className="rounded border border-orange/30 bg-orange/5 p-3 space-y-3">
+          <p className="text-xs">
+            The bank's 90-day open banking consent has run out, so TrueLayer can no
+            longer refresh access. Re-link to resume syncing — your transactions and
+            categories stay exactly as they are.
+          </p>
+          {/* Same nickname → the existing consent row is updated in place, so accounts
+              and history stay attached rather than arriving as a duplicate bank. */}
+          <form
+            action="/consents"
+            method="post"
+            encType="application/x-www-form-urlencoded"
+          >
+            <input type="hidden" name="nickname" value={consent.nickname} />
+            <button className="btn-cta text-xs" type="submit">
+              Re-link {consent.nickname} <ArrowRight className="size-3.5" />
+            </button>
+          </form>
+        </div>
+      ) : (
+        consent.last_sync_error && (
+          <p className="text-xs text-danger mono break-all">
+            {consent.last_sync_error}
+          </p>
+        )
       )}
 
       <footer className="flex flex-wrap gap-2 pt-1">

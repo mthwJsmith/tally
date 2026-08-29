@@ -11,6 +11,9 @@ use chrono::Utc;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex;
 
 const AUTH_BASE: &str = "https://auth.truelayer.com";
 const DATA_BASE: &str = "https://api.truelayer.com/data/v1";
@@ -28,6 +31,28 @@ pub struct TrueLayerClient {
     pub client_secret: String,
     pub redirect_uri_base: String, // e.g. https://tally.example.com/auth
     http: Client,
+    /// One lock per consent id, guarding token refresh.
+    ///
+    /// A single sync makes a dozen-odd Data API calls, and each one asks for a fresh access
+    /// token while holding the *same* `Consent` snapshot it was handed at the top of the sync.
+    /// Without this, every one of those calls sees the stale `expires_at`, decides the token
+    /// is expired, and posts the same refresh token to `/connect/token` again — a dozen
+    /// identical token requests per bank per hour. Serialising on the consent and re-reading
+    /// the row inside the lock collapses that to exactly one.
+    refresh_locks: Arc<StdMutex<HashMap<i64, Arc<Mutex<()>>>>>,
+}
+
+/// TrueLayer answered `invalid_grant` on `/connect/token`: the consent itself is dead, not the
+/// access token. Under PSD2 a consent lasts 90 days, after which the bank requires the user to
+/// re-authenticate in person (SCA); the user revoking access at the bank looks identical.
+/// Neither is recoverable by retrying — only a fresh OAuth flow brings the link back.
+#[derive(Debug, thiserror::Error)]
+#[error("TrueLayer consent is no longer valid (invalid_grant) — this bank must be re-linked")]
+pub struct ConsentRevoked;
+
+/// True if `err` (or anything it wraps) is a dead consent.
+pub fn is_consent_revoked(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<ConsentRevoked>())
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +72,7 @@ impl TrueLayerClient {
             client_secret,
             redirect_uri_base,
             http,
+            refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -119,6 +145,10 @@ impl TrueLayerClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if body.contains("invalid_grant") {
+                return Err(anyhow::Error::new(ConsentRevoked)
+                    .context(format!("refresh failed: status {status}, body: {body}")));
+            }
             return Err(anyhow!("refresh failed: status {status}, body: {body}"));
         }
         Ok(resp.json().await.context("parsing refresh response")?)
@@ -142,20 +172,44 @@ impl TrueLayerClient {
     /// Returns a valid access token for the consent, refreshing if needed.
     /// Mutates the DB if a refresh occurs.
     pub async fn fresh_access_token(&self, db: &Db, consent: &Consent) -> Result<String> {
+        // Fast path: the snapshot we were handed is still good.
         if !consent.is_access_token_expired() {
             return db.decrypt_access_token(consent);
         }
-        let refresh = db.decrypt_refresh_token(consent)?;
+
+        let lock = self.refresh_lock(consent.id);
+        let _guard = lock.lock().await;
+
+        // Re-read under the lock. An earlier call in this same sync may already have
+        // refreshed, in which case the caller's snapshot — and the refresh token inside it —
+        // is stale, and refreshing off it would be a pointless second round trip.
+        let current = db
+            .get_consent(consent.id)
+            .await?
+            .ok_or_else(|| anyhow!("consent {} no longer exists", consent.id))?;
+        if !current.is_access_token_expired() {
+            return db.decrypt_access_token(&current);
+        }
+
+        let refresh = db.decrypt_refresh_token(&current)?;
         let new_tokens = self.refresh(&refresh).await?;
         let expires_at = Utc::now().timestamp() + new_tokens.expires_in;
         db.update_tokens(
-            consent.id,
+            current.id,
             &new_tokens.access_token,
             &new_tokens.refresh_token,
             expires_at,
         )
         .await?;
         Ok(new_tokens.access_token)
+    }
+
+    fn refresh_lock(&self, consent_id: i64) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.entry(consent_id).or_default().clone()
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(
@@ -391,5 +445,30 @@ impl TrueLayerClient {
         }
         let body: ApiResponse<TLDirectDebit> = resp.json().await?;
         Ok(body.results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revoked_consent_survives_context_wrapping() {
+        // The importer sees this error only after `.context("get_accounts")` and the
+        // `{e:#}` formatting in between, so the marker has to be found by downcast down
+        // the whole chain rather than by matching on the rendered message.
+        let err = anyhow::Error::new(ConsentRevoked)
+            .context("refresh failed: status 400 Bad Request")
+            .context("get_accounts");
+        assert!(is_consent_revoked(&err));
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_treated_as_revoked() {
+        // A 500 or a timeout must stay retryable — flagging it `reauth` would park a
+        // healthy bank until the user needlessly re-linked it.
+        let err = anyhow!("refresh failed: status 503 Service Unavailable")
+            .context("get_accounts");
+        assert!(!is_consent_revoked(&err));
     }
 }

@@ -276,7 +276,12 @@ impl Db {
                     consent_expires_at = excluded.consent_expires_at,
                     scopes = excluded.scopes,
                     updated_at = excluded.updated_at,
-                    enabled = 1",
+                    enabled = 1,
+                    -- Re-linking is the cure for a `reauth`/`fail` consent: clear the old
+                    -- health state so the scheduler stops skipping it and the UI stops
+                    -- showing the stale error.
+                    last_sync_status = NULL,
+                    last_sync_error = NULL",
                 params![
                     nickname,
                     credentials_id,

@@ -45,14 +45,40 @@ impl Importer {
         let (tl_accounts, tl_cards) = match self.fetch_tl_inventory(consent).await {
             Ok(v) => v,
             Err(e) => {
-                let msg = format!("failed to fetch TL inventory: {e:#}");
+                // A dead consent is not a transient sync failure — no retry ever fixes it, the
+                // user has to walk the OAuth flow again. Give it a status of its own so the UI
+                // can offer the re-link, and nudge once rather than every hour.
+                let revoked = crate::clients::truelayer::is_consent_revoked(&e);
+                let (status, msg) = if revoked {
+                    (
+                        "reauth",
+                        format!(
+                            "{} needs re-linking — the bank's 90-day open-banking consent has expired (or was revoked). Re-link it on the Banks page; the transactions already imported stay put.",
+                            consent.nickname
+                        ),
+                    )
+                } else {
+                    ("fail", format!("failed to fetch TL inventory: {e:#}"))
+                };
                 error!("{msg}");
+                let already_flagged = consent.last_sync_status.as_deref() == Some("reauth");
                 self.db
-                    .finish_sync_log(log_id, "fail", 0, 0, 0, 0, Some(&msg))
+                    .finish_sync_log(log_id, status, 0, 0, 0, 0, Some(&msg))
                     .await?;
                 self.db
-                    .touch_consent_sync_status(consent.id, "fail", Some(&msg))
+                    .touch_consent_sync_status(consent.id, status, Some(&msg))
                     .await?;
+                if revoked && !already_flagged {
+                    self.notifier
+                        .send_telegram_text(
+                            &format!(
+                                "🔗 *Bank link expired* — {}\n\nIts 90-day consent ran out, so syncing has stopped. Re-link it on the Banks page to resume.",
+                                consent.nickname
+                            ),
+                            false,
+                        )
+                        .await;
+                }
                 return Err(e);
             }
         };
