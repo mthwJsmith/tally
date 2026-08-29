@@ -156,7 +156,7 @@ Full list is in `apps/api/.env.example`. The ones you usually need:
 | `TALLY_ENABLE_REMINDERS` | `true` (default) runs reminders/Telegram/sync; set `false` on serverless |
 | `TALLY_REDIRECT_URI_BASE` | Public base URL TrueLayer redirects back to |
 | `TALLY_OIDC_ISSUER` / `TALLY_OIDC_AUDIENCE` | External OIDC provider for the MCP connector |
-| `TALLY_SECURE_COOKIES` | Set to `true` when served over HTTPS |
+| `TALLY_SECURE_COOKIES` | `true` (default) marks session cookies HTTPS-only; set `false` only for plain-HTTP access (e.g. raw LAN IP — `http://localhost` works regardless) |
 | `TALLY_TRUST_PROXY` | Set to `true` only behind a trusted reverse proxy (rate-limit keys then use `X-Forwarded-For`) |
 
 ## MCP connector
